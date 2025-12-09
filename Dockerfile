@@ -2,11 +2,6 @@ FROM python:latest
 
 WORKDIR /scripts
 
+COPY requirements.txt .
 
-RUN pip install --no-cache-dir \
-    requests \
-    urllib3 \
-    certifi \
-    python-hosts \
-    graphviz \
-    python-dotenv
+RUN pip install --no-cache-dir -r requirements.txt

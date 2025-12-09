@@ -20,9 +20,14 @@ There are two ways to install and use the ACI Tool:
 The easiest way to deploy this tool is using the provided container script. This will build a Docker/Podman container that handles all dependencies and creates an alias for easy command execution from the host.
 
 ```bash
-git clone <your-repo>
+git clone https://github.com/LoveSkylark/acitool.git
 cd acitool
 ./deploy_container.sh
+```
+or:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LoveSkylark/acitool/refs/heads/main/deploy_container.sh | sudo bash
 ```
 
 **What this does:**
@@ -41,7 +46,7 @@ acitool <command> [args]
 If you prefer to run the tool directly with Python or want to customize the environment:
 
 ```bash
-git clone <your-repo>
+git clone https://github.com/LoveSkylark/acitool.git
 cd acitool/scripts
 python3 -m pip install -r requirements.txt
 ```
