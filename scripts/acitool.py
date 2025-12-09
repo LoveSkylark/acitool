@@ -1337,8 +1337,12 @@ def main():
         logger.info("Example: export APIC_URL=https://apic.example.com")
         exit(1)
 
+    # Get VERIFY_SSL setting from environment (defaults to False)
+    verify_ssl_env = os.environ.get('VERIFY_SSL', 'false').lower()
+    verify_ssl = verify_ssl_env in ('true', 'yes', '1')
+
     args = parse_args()
-    apic = ACIClient(url)
+    apic = ACIClient(url, verify_ssl=verify_ssl)
     apic.login()
 
     # Dispatch to appropriate command handler method

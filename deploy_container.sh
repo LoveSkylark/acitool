@@ -36,7 +36,7 @@ echo "Copying profile configuration..."
 sudo cp ./acitool/profile.d/* /etc/profile.d/ 2>/dev/null || echo "Note: No profile.d files found to copy"
 
 echo "Building the container..."
-$CONTAINER_CMD build --no-cache -t pyscript ./acitool/.
+$CONTAINER_CMD build --no-cache --build-arg VERIFY_SSL=false -t pyscript ./acitool/.
 
 echo "Starting the container..."
 $CONTAINER_CMD run -itd --name pyscript -v ./acitool/scripts:/scripts pyscript
