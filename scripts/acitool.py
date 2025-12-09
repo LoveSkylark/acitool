@@ -15,6 +15,20 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from typing import Dict, List, Optional, Tuple, Set, Any
 
+# Import local modules
+from config import (
+    API_NODE_CLASS, API_CLASS, EXCLUDED_CIDRS,
+    RETRY_TOTAL, RETRY_BACKOFF_FACTOR, RETRY_STATUS_FORCELIST, RETRY_ALLOWED_METHODS,
+    API_CACHE_SIZE, NODE_INVENTORY_CACHE_SIZE
+)
+from aci_parsers import (
+    RE_VRF, RE_BD, RE_EPG, RE_EPG_DN, RE_CEP,
+    RE_L3OUT, RE_L3OUT_DN, RE_L3OUT_PATH,
+    RE_PATH_TDN, RE_AAEP_TDN, RE_VLAN_POOL_TDN,
+    parse_regex, extract_tenant_from_dn, format_epg_label
+)
+from aci_tree import ACITreeBuilder
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -22,17 +36,6 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
-
-# -------------------------------
-# Constants
-# -------------------------------
-
-# API Endpoints
-API_NODE_CLASS = "/api/node/class"
-API_CLASS = "/api/class"
-
-# Excluded Networks (for filtering common/private ranges)
-EXCLUDED_CIDRS = {"0.0.0.0/0", "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"}
 
 # -------------------------------
 # Argument Parsing
@@ -79,31 +82,6 @@ def parse_args():
 
     return parser.parse_args()
 
-# -------------------------------------------------------
-#  GLOBAL COMPILED REGEX (runs once, reused everywhere)
-# -------------------------------------------------------
-# ACI Object DNs
-RE_VRF                  = re.compile(r"uni/tn-(?P<tenant>[^/]+)/ctx-(?P<vrf>[^/]+)")
-RE_BD                   = re.compile(r"uni/tn-(?P<tenant>[^/]+)/BD-(?P<bd>[^/]+)")
-RE_EPG                  = re.compile(r"uni/tn-(?P<tenant>[^/]+)/ap-(?P<ap>[^/]+)/epg-(?P<epg>[^/]+)")
-RE_EPG_DN               = re.compile(r"uni/tn-[^/]+/ap-(?P<ap>[^/]+)/epg-(?P<epg>[^/]+)")
-RE_CEP                  = re.compile(r"uni/tn-(?P<tenant>[^/]+)/ap-(?P<ap>[^/]+)/epg-(?P<epg>[^/]+)/cep-(?P<cep>[^/]+)")
-
-# L3Out DNs
-RE_L3OUT                = re.compile(r"uni/tn-(?P<tenant>[^/]+)/out-(?P<l3out>[^/]+)")
-RE_L3OUT_DN             = re.compile(r"uni/tn-[^/]+/out-(?P<l3out>[^/]+)/lnodep-[^/]+/lifp-(?P<lifp>[^/]+)")
-RE_L3OUT_PATH           = re.compile(r"uni/tn-(?P<tenant>[^/]+)/out-(?P<out>[^/]+)/lnodep-[^/]+/lifp-(?P<lifp>[^/]+)")
-
-# Topology and Infrastructure
-RE_PATH_TDN             = re.compile(r"topology/pod-(?P<pod>\d+)/(?:prot)?paths-(?P<node>\d+(?:-\d+)?)/pathep-\[(?P<iface>[^\]]+)\]")
-RE_AAEP_TDN             = re.compile(r"attentp-([^\]]+)$")
-RE_VLAN_POOL_TDN        = re.compile(r"vlanns-\[(?P<pool>[^\]]+)\]")
-
-def parse_regex(regex, text: str) -> Optional[Dict[str, Any]]:
-    """Small safe helper to reduce boilerplate."""
-    m = regex.search(text)
-    return m.groupdict() if m else None
-
 # -------------------------------
 # ACI Client Class
 # -------------------------------
@@ -118,10 +96,10 @@ class ACIClient:
 
         # Configure retry strategy for resilient HTTP requests
         retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+            total=RETRY_TOTAL,
+            backoff_factor=RETRY_BACKOFF_FACTOR,
+            status_forcelist=RETRY_STATUS_FORCELIST,
+            allowed_methods=RETRY_ALLOWED_METHODS
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
@@ -131,7 +109,7 @@ class ACIClient:
         if not verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    @lru_cache(maxsize=64)
+    @lru_cache(maxsize=API_CACHE_SIZE)
     def cached_api(self, endpoint: str):
         return self.get_api(endpoint) or []
 
@@ -532,7 +510,7 @@ class ACIClient:
         else:
             print("[!] No subnets found matching the criteria.")
 
-    @lru_cache(maxsize=1)
+    @lru_cache(maxsize=NODE_INVENTORY_CACHE_SIZE)
     def get_node_inventory(self):
         """
         Fetch and cache APIC fabric node inventory.
@@ -575,41 +553,17 @@ class ACIClient:
             return f"{resolved_names[0]} & {resolved_names[1]} [{node_string}]"
 
 
-    @staticmethod
-    def print_tree(tree, label=None):
-        if label:
-            print(label)
+    # =========================================================================
+    # Command Handler Methods
+    # =========================================================================
 
-        def walk(node, depth):
-            indent = "  " * depth
-            if isinstance(node, dict):
-                for k, v in node.items():
-                    if k == "_leaf":
-                        for item in v:
-                            print(f"{indent}{item}")
-                    else:
-                        print(f"{indent}{k}")
-                        walk(v, depth + 1)
-            elif isinstance(node, list):
-                for item in node:
-                    print(f"{indent}{item}")
-            else:
-                print(f"{indent}{node}")
-
-        walk(tree, 0)
-
-def handle_clean_command(apic, clean_cmd):
-    # Cached data (only pulled once)
-
-    # -------------------------------------------------------------------------
-    # CLEAN VRF
-    # -------------------------------------------------------------------------
-    if clean_cmd == "vrf":
+    def handle_clean_vrf(self):
+        """List VRFs with no BD or L3Out attached."""
         print("Checking VRFs not attached to any BD or L3Out...\n")
 
-        ctxs     = apic.cached_api("/api/node/class/fvCtx.json")
-        l3_refs  = apic.cached_api("/api/node/class/l3extRsEctx.json")
-        bd_refs  = apic.cached_api("/api/node/class/fvRsCtx.json")
+        ctxs = self.cached_api("/api/node/class/fvCtx.json")
+        l3_refs = self.cached_api("/api/node/class/l3extRsEctx.json")
+        bd_refs = self.cached_api("/api/node/class/fvRsCtx.json")
 
         all_vrfs = {}
         for item in ctxs:
@@ -620,7 +574,7 @@ def handle_clean_command(apic, clean_cmd):
         referenced = {}
         for ref_list, regex in [(bd_refs, RE_BD), (l3_refs, RE_L3OUT)]:
             for item in ref_list:
-                key  = next(iter(item))
+                key = next(iter(item))
                 attr = item[key]["attributes"]
                 parsed = parse_regex(regex, attr["dn"])
                 if parsed and attr.get("tnFvCtxName"):
@@ -633,25 +587,21 @@ def handle_clean_command(apic, clean_cmd):
         }
 
         if tree:
-            apic.print_tree(tree)
+            self.print_tree(tree)
         else:
             print("All VRFs are in use.")
-        return
 
-    # -------------------------------------------------------------------------
-    # CLEAN BD (checking for BD's L3 Out & EPG references)
-    # -------------------------------------------------------------------------
-    if clean_cmd == "bd":
+    def handle_clean_bd(self):
+        """List BDs with no EPG or L3Out attached."""
         print("Checking Bridge Domains not attached to any EPG or L3Out...\n")
 
-        bds = apic.cached_api("/api/node/class/fvBD.json")  # Fetch all BDs
-        epg_bd = apic.cached_api("/api/node/class/fvRsBd.json")  # EPG → BD references
-        l3_sub = apic.cached_api("/api/node/class/l3extSubnet.json")  # L3Out Subnet references
+        bds = self.cached_api("/api/node/class/fvBD.json")
+        epg_bd = self.cached_api("/api/node/class/fvRsBd.json")
+        l3_sub = self.cached_api("/api/node/class/l3extSubnet.json")
 
         all_bds = {}
         used_bds = set()
 
-        # Step 1: Collect all BDs by tenant
         for item in bds:
             parsed = parse_regex(RE_BD, item["fvBD"]["attributes"]["dn"])
             if parsed:
@@ -659,50 +609,38 @@ def handle_clean_command(apic, clean_cmd):
                 bd = parsed["bd"]
                 all_bds.setdefault(tenant, set()).add(bd)
 
-        # Step 2: Collect BDs used by EPGs (via fvRsBd)
         for item in epg_bd:
             attr = item["fvRsBd"]["attributes"]
             bd_name = attr.get("tnFvBDName")
             if bd_name:
-                # Mark this BD as used
                 used_bds.add(bd_name)
 
-        # Step 3: Collect BDs used by L3Out Subnets (via l3extSubnet)
         for item in l3_sub:
             attr = item["l3extSubnet"]["attributes"]
             bd_name = attr.get("tnFvBDName")
             if bd_name:
-                # Mark this BD as used
                 used_bds.add(bd_name)
 
-        # Step 4: Identify unused BDs for each tenant
         unused_bds = {
             tenant: sorted(bd_set - used_bds) for tenant, bd_set in all_bds.items()
         }
-
-        # Step 5: Filter out tenants that have no unused BDs
         unused_bds = {tenant: bds for tenant, bds in unused_bds.items() if bds}
 
-        # Step 6: Print only tenants that have unused BDs
         if unused_bds:
-            apic.print_tree(unused_bds)
+            self.print_tree(unused_bds)
         else:
             print("No unused Bridge Domains found.")
-        return
 
-
-    # -------------------------------------------------------------------------
-    # CLEAN EPG (no contract + no members + no static bindings)
-    # -------------------------------------------------------------------------
-    if clean_cmd == "epg":
+    def handle_clean_epg(self):
+        """List EPGs without contracts, members, or static bindings."""
         print("Checking EPGs without any contract, members, or static bindings...\n")
 
-        epgs     = apic.cached_api("/api/node/class/fvAEPg.json")
-        prov     = apic.cached_api("/api/node/class/fvRsProv.json")
-        cons     = apic.cached_api("/api/node/class/fvRsCons.json")
-        macs     = apic.cached_api("/api/node/class/fvMac.json")
-        ips      = apic.cached_api("/api/node/class/fvIp.json")
-        paths    = apic.cached_api("/api/node/class/fvRsPathAtt.json")
+        epgs = self.cached_api("/api/node/class/fvAEPg.json")
+        prov = self.cached_api("/api/node/class/fvRsProv.json")
+        cons = self.cached_api("/api/node/class/fvRsCons.json")
+        macs = self.cached_api("/api/node/class/fvMac.json")
+        ips = self.cached_api("/api/node/class/fvIp.json")
+        paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
 
         all_epgs = {}
         for item in epgs:
@@ -713,7 +651,7 @@ def handle_clean_command(apic, clean_cmd):
         used = {}
         for ref_list in (prov, cons, macs, ips, paths):
             for item in ref_list:
-                key  = next(iter(item))
+                key = next(iter(item))
                 parsed = parse_regex(RE_EPG, item[key]["attributes"]["dn"])
                 if parsed:
                     used.setdefault(parsed["tenant"], {}).setdefault(parsed["ap"], set()).add(parsed["epg"])
@@ -726,21 +664,18 @@ def handle_clean_command(apic, clean_cmd):
                     tree.setdefault(tenant, {}).setdefault(ap, unused)
 
         if tree:
-            apic.print_tree(tree)
+            self.print_tree(tree)
         else:
             print("All EPGs have contracts, members, or static bindings.")
-        return
 
-    # -------------------------------------------------------------------------
-    # CLEAN EMPTY EPG (no IP/MAC/static bindings)
-    # -------------------------------------------------------------------------
-    if clean_cmd == "empty":
+    def handle_clean_empty(self):
+        """List EPGs with no MAC, IP addresses, or static bindings."""
         print("Checking EPGs with no MAC, IP addresses, or static bindings...\n")
 
-        epgs     = apic.cached_api("/api/node/class/fvAEPg.json")
-        macs     = apic.cached_api("/api/node/class/fvMac.json")
-        ips      = apic.cached_api("/api/node/class/fvIp.json")
-        paths    = apic.cached_api("/api/node/class/fvRsPathAtt.json")
+        epgs = self.cached_api("/api/node/class/fvAEPg.json")
+        macs = self.cached_api("/api/node/class/fvMac.json")
+        ips = self.cached_api("/api/node/class/fvIp.json")
+        paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
 
         all_epgs = {}
         for item in epgs:
@@ -764,22 +699,19 @@ def handle_clean_command(apic, clean_cmd):
                     tree.setdefault(tenant, {}).setdefault(ap, empty)
 
         if tree:
-            apic.print_tree(tree)
+            self.print_tree(tree)
         else:
             print("All EPGs have MAC, IP addresses, or static bindings.")
-        return
 
-    # -------------------------------------------------------------------------
-    # CLEAN AAEP
-    # -------------------------------------------------------------------------
-    if clean_cmd == "aaep":
+    def handle_clean_aaep(self):
+        """List AAEPs not assigned anywhere."""
         print("Checking AAEPs not assigned anywhere...\n")
 
-        aaeps    = apic.cached_api("/api/node/class/infraAttEntityP.json")
-        aaep_ref = apic.cached_api("/api/node/class/infraRsAttEntP.json")
+        aaeps = self.cached_api("/api/node/class/infraAttEntityP.json")
+        aaep_ref = self.cached_api("/api/node/class/infraRsAttEntP.json")
 
         all_aaeps = {item["infraAttEntityP"]["attributes"]["name"] for item in aaeps}
-        used      = set()
+        used = set()
 
         for item in aaep_ref:
             key = next(iter(item))
@@ -791,19 +723,16 @@ def handle_clean_command(apic, clean_cmd):
         unused = sorted(all_aaeps - used)
 
         if unused:
-            apic.print_tree({"Global": {"AAEPs": unused}})
+            self.print_tree({"Global": {"AAEPs": unused}})
         else:
             print("All AAEPs are assigned somewhere.")
-        return
 
-    # -------------------------------------------------------------------------
-    # CLEAN VLAN POOL
-    # -------------------------------------------------------------------------
-    if clean_cmd == "vlan":
+    def handle_clean_vlan(self):
+        """List VLAN Pools not used by any Domain or AAEP."""
         print("Checking VLAN Pools not used by any Domain or AAEP...\n")
 
-        pools    = apic.cached_api("/api/node/class/fvnsVlanInstP.json")
-        pool_ref = apic.cached_api("/api/node/class/infraRsVlanNs.json")
+        pools = self.cached_api("/api/node/class/fvnsVlanInstP.json")
+        pool_ref = self.cached_api("/api/node/class/infraRsVlanNs.json")
 
         all_pools = {item["fvnsVlanInstP"]["attributes"]["name"] for item in pools}
 
@@ -817,657 +746,588 @@ def handle_clean_command(apic, clean_cmd):
         unused = sorted(all_pools - used)
 
         if unused:
-            apic.print_tree({"Global": {"vlan_pools": unused}})
+            self.print_tree({"Global": {"vlan_pools": unused}})
         else:
             print("All VLAN Pools are referenced.")
-        return
 
-def handle_contract_command(apic, contract_name, tenant_filter=None):
-    """
-    Find all tenants owning a contract with this name, then
-    run the existing code for each tenant individually.
-    Uses apic.collect_epgs(), epg_tenant(), epg_label(), l3out_name_from_dn() for structured output.
-    """
+    def handle_clean_command(self, clean_cmd: str):
+        """Dispatch to appropriate clean subcommand handler."""
+        handlers = {
+            "vrf": self.handle_clean_vrf,
+            "bd": self.handle_clean_bd,
+            "epg": self.handle_clean_epg,
+            "empty": self.handle_clean_empty,
+            "aaep": self.handle_clean_aaep,
+            "vlan": self.handle_clean_vlan,
+        }
 
-    print(f"Looking up contract: {contract_name}\n")
+        handler = handlers.get(clean_cmd)
+        if handler:
+            handler()
+        else:
+            print(f"Unknown clean command: {clean_cmd}")
 
-    # ----------------------------------------------------------------------
-    # Cached API queries (only once)
-    # ----------------------------------------------------------------------
-    contracts = apic.cached_api("/api/node/class/vzBrCP.json")
-    prov_epgs = apic.cached_api("/api/node/class/fvRsProv.json")
-    cons_epgs = apic.cached_api("/api/node/class/fvRsCons.json")
+    def handle_contract_command(self, contract_name: str, tenant_filter: Optional[str] = None):
+        """Find and display contract providers, consumers, and exports."""
+        print(f"Looking up contract: {contract_name}\n")
 
-    # ----------------------------------------------------------------------
-    # Find all tenants that own a contract with this name
-    # ----------------------------------------------------------------------
-    if tenant_filter:
-        tenants = [tenant_filter]
-    else:
-        tenants = []
-        for item in contracts:
-            attr = item["vzBrCP"]["attributes"]
-            if attr["name"] == contract_name:
+        # Cached API queries
+        contracts = self.cached_api("/api/node/class/vzBrCP.json")
+        prov_epgs = self.cached_api("/api/node/class/fvRsProv.json")
+        cons_epgs = self.cached_api("/api/node/class/fvRsCons.json")
+
+        # Find all tenants that own a contract with this name
+        if tenant_filter:
+            tenants = [tenant_filter]
+        else:
+            tenants = []
+            for item in contracts:
+                attr = item["vzBrCP"]["attributes"]
+                if attr["name"] == contract_name:
+                    dn = attr["dn"]
+                    tenant = dn.split("/")[1][3:]
+                    tenants.append(tenant)
+            tenants = sorted(set(tenants))
+
+        # If exact contract not found, try prefix match
+        if not tenants:
+            prefix_tree = {}
+            for item in contracts:
+                attr = item["vzBrCP"]["attributes"]
+                name = attr["name"]
                 dn = attr["dn"]
                 tenant = dn.split("/")[1][3:]
-                tenants.append(tenant)
-        tenants = sorted(set(tenants))
-        
-    # ----------------------------------------------------------------------
-    # If exact contract not found, try prefix match (group by tenant)
-    # ----------------------------------------------------------------------
-    if not tenants:
-        prefix_tree = {}
+                if name.startswith(contract_name):
+                    prefix_tree.setdefault(tenant, []).append(name)
 
-        for item in contracts:
-            attr = item["vzBrCP"]["attributes"]
-            name = attr["name"]
-            dn = attr["dn"]
-            tenant = dn.split("/")[1][3:]  # tn-XYZ → XYZ
+            if prefix_tree:
+                print(f"No exact match for contract '{contract_name}'.\n")
+                sorted_tree = {
+                    tenant: sorted(names)
+                    for tenant, names in sorted(prefix_tree.items())
+                }
+                self.print_tree(sorted_tree)
+                return
 
-            # Only include contracts that start with the prefix
-            if name.startswith(contract_name):
-                prefix_tree.setdefault(tenant, []).append(name)
-
-        # If we found prefix matches inside (filtered) tenant(s)
-        if prefix_tree:
-            print(f"No exact match for contract '{contract_name}'.\n")
-
-            # Sort tenants and contracts
-            sorted_tree = {
-                tenant: sorted(names)
-                for tenant, names in sorted(prefix_tree.items())
-            }
-
-            apic.print_tree(sorted_tree)
+            print(f"❌ Contract '{contract_name}' not found.")
             return
 
-        # Nothing found even with prefix search
-        print(f"❌ Contract '{contract_name}' not found.")
-        return
+        # Run logic once per tenant
+        for tenant in tenants:
+            print("\n" + "=" * 80)
+            print(f"Processing tenant: {tenant}")
+            print("=" * 80 + "\n")
 
-    # ----------------------------------------------------------------------
-    # Run logic once per tenant
-    # ----------------------------------------------------------------------
-    for tenant in tenants:
-        print("\n" + "=" * 80)
-        print(f"Processing tenant: {tenant}")
-        print("=" * 80 + "\n")
+            # Build contract DN map for this tenant
+            contract_dn_map = {}
+            for item in contracts:
+                attr = item["vzBrCP"]["attributes"]
+                if attr["name"] == contract_name:
+                    dn = attr["dn"]
+                    t = dn.split("/")[1][3:]
+                    if t == tenant:
+                        scope = attr.get("scope", "local")
+                        contract_dn_map[dn] = {"tenant": t, "scope": scope}
 
-        # Build contract DN map for this tenant
-        contract_dn_map = {}
-        for item in contracts:
-            attr = item["vzBrCP"]["attributes"]
-            if attr["name"] == contract_name:
-                dn = attr["dn"]
-                t = dn.split("/")[1][3:]
-                if t == tenant:
-                    scope = attr.get("scope", "local")
-                    contract_dn_map[dn] = {"tenant": t, "scope": scope}
+            if not contract_dn_map:
+                print(f"  ⚠️ Contract not found in tenant {tenant}")
+                continue
 
-        if not contract_dn_map:
-            print(f"  ⚠️ Contract not found in tenant {tenant}")
-            continue
+            # Store for helper functions
+            self.contract_dn_map = contract_dn_map
 
-        # Attach DN map to ACI client for helper functions
-        apic.contract_dn_map = contract_dn_map
+            # Exported contracts (only for global scope)
+            exported_tree = {}
+            if scope == "global":
+                exported_tree = {"Exported to:": {}}
+                dn = list(contract_dn_map.keys())[0]
+                exported_contracts = self.cached_api(
+                    f"/api/mo/{dn}.json?query-target=subtree&target-subtree-class=vzRtIf"
+                )
+                pattern = re.compile(r"uni/tn-(?P<tenant>[^/]+)/cif-(?P<cif>[^/]+)")
+                for item in exported_contracts:
+                    vz = item.get("vzRtIf")
+                    if vz and "attributes" in vz:
+                        match = pattern.match(vz["attributes"].get("tDn", ""))
+                        if match:
+                            ext_tenant = match.group("tenant")
+                            cif = match.group("cif")
+                            exported_tree["Exported to:"].setdefault(cif, []).append(ext_tenant)
+                for cif in exported_tree["Exported to:"]:
+                    exported_tree["Exported to:"][cif].sort()
+                exported_tree["Exported to:"] = dict(sorted(exported_tree["Exported to:"].items()))
 
-        # ----------------------------------------------------------------------
-        # Exported contracts (only for global scope)
-        # ----------------------------------------------------------------------
-        exported_tree = {}
-        if scope == "global":
-            exported_tree = {"Exported to:": {}}
-            dn = list(contract_dn_map.keys())[0]
-            exported_contracts = apic.cached_api(
-                f"/api/mo/{dn}.json?query-target=subtree&target-subtree-class=vzRtIf"
-            )
-            pattern = re.compile(r"uni/tn-(?P<tenant>[^/]+)/cif-(?P<cif>[^/]+)")
-            for item in exported_contracts:
-                vz = item.get("vzRtIf")
-                if vz and "attributes" in vz:
-                    match = pattern.match(vz["attributes"].get("tDn", ""))
-                    if match:
-                        ext_tenant = match.group("tenant")
-                        cif = match.group("cif")
-                        exported_tree["Exported to:"].setdefault(cif, []).append(ext_tenant)
-            # Sort CIF tenants and contracts
-            for cif in exported_tree["Exported to:"]:
-                exported_tree["Exported to:"][cif].sort()
-            exported_tree["Exported to:"] = dict(sorted(exported_tree["Exported to:"].items()))
+            # Providers & Consumers
+            providers_map = self.collect_epgs(prov_epgs, "fvRsProv")
+            consumers_map = self.collect_epgs(cons_epgs, "fvRsCons")
 
-        # ----------------------------------------------------------------------
-        # Providers & Consumers
-        # ----------------------------------------------------------------------
-        providers_map = apic.collect_epgs(prov_epgs, "fvRsProv")
-        consumers_map = apic.collect_epgs(cons_epgs, "fvRsCons")
+            # Convert to tree format
+            provider_tree = {"Providers": {}}
+            for t, epgs in providers_map.items():
+                for label, imported in epgs:
+                    final_label = f"{label}{' (imported)' if imported else ''}"
+                    provider_tree["Providers"].setdefault(t, []).append(final_label)
 
-        # Convert provider/consumer maps into tree format
-        provider_tree = {"Providers": {}}
-        for t, epgs in providers_map.items():
-            for label, imported in epgs:
-                final_label = f"{label}{' (imported)' if imported else ''}"
-                provider_tree["Providers"].setdefault(t, []).append(final_label)
+            consumer_tree = {"Consumers": {}}
+            for t, epgs in consumers_map.items():
+                for label, imported in epgs:
+                    final_label = f"{label}{' (imported)' if imported else ''}"
+                    consumer_tree["Consumers"].setdefault(t, []).append(final_label)
 
-        consumer_tree = {"Consumers": {}}
-        for t, epgs in consumers_map.items():
-            for label, imported in epgs:
-                final_label = f"{label}{' (imported)' if imported else ''}"
-                consumer_tree["Consumers"].setdefault(t, []).append(final_label)
-
-        # ----------------------------------------------------------------------
-        # Final Output
-        # ----------------------------------------------------------------------
-        print(f"Type: {scope}\n")
-        apic.print_tree(provider_tree)
-        print()
-        apic.print_tree(consumer_tree)
-        if scope == "global":
+            # Final Output
+            print(f"Type: {scope}\n")
+            self.print_tree(provider_tree)
             print()
-            if exported_tree["Exported to:"]:
-                apic.print_tree(exported_tree)
+            self.print_tree(consumer_tree)
+            if scope == "global":
+                print()
+                if exported_tree["Exported to:"]:
+                    self.print_tree(exported_tree)
 
-    if tenant_filter:
-        handle_filter_command(apic, contract_name, tenant_filter)
+        if tenant_filter:
+            self.handle_filter_command(contract_name, tenant_filter)
 
-def handle_tenant_command(apic, tenant_name):
-    print(f"Looking for all bindings in tenant: {tenant_name}\n")
+    def handle_tenant_command(self, tenant_name: str):
+        """List all static and SVI bindings for a tenant."""
+        print(f"Looking for all bindings in tenant: {tenant_name}\n")
 
-    # Cached API calls
-    static_paths = apic.cached_api("/api/node/class/fvRsPathAtt.json")
-    svi_paths    = apic.cached_api("/api/node/class/l3extRsPathL3OutAtt.json")
+        static_paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
+        svi_paths = self.cached_api("/api/node/class/l3extRsPathL3OutAtt.json")
 
-    static_tree = {}
-    svi_tree = {}
+        static_tree = {}
+        svi_tree = {}
+        TENANT_PREFIX = f"uni/tn-{tenant_name}/"
 
-    TENANT_PREFIX = f"uni/tn-{tenant_name}/"
-
-    # -------------------------------------------------------------
-    # Static EPG-to-Path Bindings
-    # -------------------------------------------------------------
-    for item in static_paths:
-        attr = item.get("fvRsPathAtt", {}).get("attributes", {})
-        dn   = attr.get("dn", "")
-
-        if not dn.startswith(TENANT_PREFIX):
-            continue
-
-        tDn   = attr.get("tDn", "")
-        encap = attr.get("encap", "")
-
-        epg = parse_regex(RE_EPG_DN, dn)
-        path = parse_regex(RE_PATH_TDN, tDn)
-
-        if not epg or not path:
-            continue
-
-
-        apic.tree_add(
-            static_tree,
-            f"Pod-{path['pod']}",
-            apic.normalize_node_label(path['pod'], path['node']),
-            path['iface'],
-            label=f"{epg['ap']}/{epg['epg']} ({encap})"
-        )
-
-
-    # -------------------------------------------------------------
-    # SVI (L3Out) Bindings
-    # -------------------------------------------------------------
-    for item in svi_paths:
-        attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
-        dn   = attr.get("dn", "")
-
-        if not dn.startswith(TENANT_PREFIX):
-            continue
-
-        tDn   = attr.get("tDn", "")
-        encap = attr.get("encap", "")
-
-        l3 = parse_regex(RE_L3OUT_DN, dn)
-        path = parse_regex(RE_PATH_TDN, tDn)
-
-        if not l3 or not path:
-            continue
-
-        apic.tree_add(
-            svi_tree,
-            f"Pod-{path['pod']}",
-            apic.normalize_node_label(path['pod'], path['node']),
-            path['iface'],
-            label=f"{l3['l3out']}/{l3['lifp']} ({encap})"
-        )
-
-
-    # -------------------------------------------------------------
-    # Output
-    # -------------------------------------------------------------
-    if static_tree:
-        print(f"\nStatic Path Bindings for tenant '{tenant_name}':")
-        apic.print_tree(static_tree)
-    else:
-        print("\nNo static path bindings found.")
-
-    if svi_tree:
-        print(f"\nSVI (L3Out) Bindings for tenant '{tenant_name}':")
-        apic.print_tree(svi_tree)
-    else:
-        print("\nNo SVI bindings found.")
-
-def handle_ip_command(apic, ip_to_lookup):
-    print(f"Looking up IP: {ip_to_lookup}\n")
-
-    # -----------------------------
-    # Cached API calls
-    # -----------------------------
-    fv_ip_data        = apic.cached_api(f"/api/node/class/fvIp.json?query-target-filter=eq(fvIp.addr,\"{ip_to_lookup}\")")
-    l3ext_ip_data     = apic.cached_api("/api/node/class/l3extIp.json")
-    bgp_peer_data     = apic.cached_api("/api/node/class/bgpPeer.json")
-    static_routes     = apic.cached_api("/api/node/class/ipRouteP.json")
-    subnets           = apic.cached_api("/api/node/class/fvSubnet.json")
-    external_subnets  = apic.cached_api("/api/node/class/l3extSubnet.json")
-
-    # -----------------------------
-    # Process different types of matches
-    # -----------------------------
-    endpoint_found = apic.process_endpoint(fv_ip_data)
-    ospf_found     = apic.process_peer(l3ext_ip_data, ip_to_lookup, kind="l3extIp")
-    bgp_found      = apic.process_peer(bgp_peer_data, ip_to_lookup, kind="bgpPeer")
-    static_found   = apic.process_static_route(static_routes, ip_to_lookup)
-
-    # -----------------------------
-    # If nothing found, check subnets
-    # -----------------------------
-    if not any([endpoint_found, ospf_found, bgp_found, static_found]):
-        apic.process_subnet(subnets, ip_to_lookup)
-        apic.process_external_subnet(external_subnets, ip_to_lookup)
-
-def handle_port_command(apic, args):
-    node_id = args.id
-    node_name = args.name
-    port = args.port
-    port_str = f"eth{port}"
-
-    # -----------------------------
-    # Resolve pod and node
-    # -----------------------------
-    top_data = apic.cached_api("/api/node/class/topSystem.json")
-    pod_id, node_id = apic.get_pod_for_node(top_data, node_id, node_name)
-    if not pod_id:
-        print(f"Error: Could not find pod for node {node_id} ({node_name})")
-        exit(1)
-
-    # -----------------------------
-    # Fetch bindings (cached)
-    # -----------------------------
-    static_bindings = apic.cached_api("/api/node/class/fvRsPathAtt.json")
-    svi_bindings = apic.cached_api("/api/class/l3extRsPathL3OutAtt.json")
-
-    tree = {}
-
-    # -----------------------------
-    # Helper to process bindings
-    # -----------------------------
-    def process_bindings(bindings, regex, category_func, label_func):
-        for item in bindings:
-            # Extract attributes
-            attr = next(iter(item.values()))['attributes']
+        # Static EPG-to-Path Bindings
+        for item in static_paths:
+            attr = item.get("fvRsPathAtt", {}).get("attributes", {})
             dn = attr.get("dn", "")
+
+            if not dn.startswith(TENANT_PREFIX):
+                continue
+
             tDn = attr.get("tDn", "")
             encap = attr.get("encap", "")
 
-            # Check port match via tDn
-            if f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{port_str}]" not in tDn:
+            epg = parse_regex(RE_EPG_DN, dn)
+            path = parse_regex(RE_PATH_TDN, tDn)
+
+            if not epg or not path:
                 continue
 
-            # Parse DN using regex
-            match = parse_regex(regex, dn)
-            if match:
-                tenant = match["tenant"]
-                category = category_func(match)
-                label = label_func(match, encap)
-                apic.tree_add(tree, tenant, category, label=label)
+            self.tree_add(
+                static_tree,
+                f"Pod-{path['pod']}",
+                self.normalize_node_label(path['pod'], path['node']),
+                path['iface'],
+                label=f"{epg['ap']}/{epg['epg']} ({encap})"
+            )
 
-    # -----------------------------
-    # Process L2 (EPG) bindings
-    # -----------------------------
-    process_bindings(
-        static_bindings,
-        RE_EPG,
-        category_func=lambda m: f"EPG: {m['ap']}",
-        label_func=lambda m, encap: f"{m['epg']} ({encap})"
-    )
+        # SVI (L3Out) Bindings
+        for item in svi_paths:
+            attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
+            dn = attr.get("dn", "")
 
-    # -----------------------------
-    # Process L3 (SVI / L3Out) bindings
-    # -----------------------------
-    process_bindings(
-        svi_bindings,
-        RE_L3OUT_PATH,
-        category_func=lambda m: f"L3: {m['out']}",
-        label_func=lambda m, encap: f"{m['lifp']} ({encap})"
-    )
+            if not dn.startswith(TENANT_PREFIX):
+                continue
 
-    # -----------------------------
-    # Print results
-    # -----------------------------
-    device = apic.normalize_node_label(pod_id, node_id)
-    if tree:
-        print(f"\nBindings for {port_str} on {device}:")
-        apic.print_tree(tree)
-    else:
-        print(f"\nNo bindings found for {port_str} on {device}.")
+            tDn = attr.get("tDn", "")
+            encap = attr.get("encap", "")
 
-def handle_vpc_command(apic, args):
-    nodes = args.nodes
-    interface = args.interface
-    tree = {}
+            l3 = parse_regex(RE_L3OUT_DN, dn)
+            path = parse_regex(RE_PATH_TDN, tDn)
 
-    # -----------------------------
-    # 1. Parse node pair
-    # -----------------------------
-    try:
-        node1, node2 = map(int, nodes.split('-'))
-    except ValueError:
-        print(f"Error: Invalid node pair format '{nodes}'. Expected format: 221-222")
-        exit(1)
+            if not l3 or not path:
+                continue
 
-    # -----------------------------
-    # 2. Find pod ID
-    # -----------------------------
-    top_data = apic.cached_api("/api/node/class/topSystem.json")
-    pod_id = None
-    for item in top_data:
-        attr = item.get("topSystem", {}).get("attributes", {})
-        if attr.get("id") == str(node1):
-            pod_id = attr.get("podId")
-            break
+            self.tree_add(
+                svi_tree,
+                f"Pod-{path['pod']}",
+                self.normalize_node_label(path['pod'], path['node']),
+                path['iface'],
+                label=f"{l3['l3out']}/{l3['lifp']} ({encap})"
+            )
 
-    if not pod_id:
-        print(f"Error: Could not find pod for node {node1}")
-        exit(1)
+        # Output
+        if static_tree:
+            print(f"\nStatic Path Bindings for tenant '{tenant_name}':")
+            self.print_tree(static_tree)
+        else:
+            print("\nNo static path bindings found.")
 
-    vpc_pattern = f"topology/pod-{pod_id}/protpaths-{node1}-{node2}/pathep-[{interface}]"
+        if svi_tree:
+            print(f"\nSVI (L3Out) Bindings for tenant '{tenant_name}':")
+            self.print_tree(svi_tree)
+        else:
+            print("\nNo SVI bindings found.")
 
+    def handle_ip_command(self, ip_to_lookup: str):
+        """Search for an IP address in the ACI fabric."""
+        print(f"Looking up IP: {ip_to_lookup}\n")
 
-    # ----------------------------------------
-    # If no interface specified, list all VPCs
-    # ----------------------------------------
-    if not interface:
-        all_bindings = apic.cached_api("/api/node/class/fvRsPathAtt.json")
-        vpc_list = set()
+        # Cached API calls
+        fv_ip_data = self.cached_api(f"/api/node/class/fvIp.json?query-target-filter=eq(fvIp.addr,\"{ip_to_lookup}\")")
+        l3ext_ip_data = self.cached_api("/api/node/class/l3extIp.json")
+        bgp_peer_data = self.cached_api("/api/node/class/bgpPeer.json")
+        static_routes = self.cached_api("/api/node/class/ipRouteP.json")
+        subnets = self.cached_api("/api/node/class/fvSubnet.json")
+        external_subnets = self.cached_api("/api/node/class/l3extSubnet.json")
 
-        vpc_prefix = f"topology/pod-{pod_id}/protpaths-{node1}-{node2}/pathep-["
+        # Process different types of matches
+        endpoint_found = self.process_endpoint(fv_ip_data)
+        ospf_found = self.process_peer(l3ext_ip_data, ip_to_lookup, kind="l3extIp")
+        bgp_found = self.process_peer(bgp_peer_data, ip_to_lookup, kind="bgpPeer")
+        static_found = self.process_static_route(static_routes, ip_to_lookup)
 
-        for item in all_bindings:
+        # If nothing found, check subnets
+        if not any([endpoint_found, ospf_found, bgp_found, static_found]):
+            self.process_subnet(subnets, ip_to_lookup)
+            self.process_external_subnet(external_subnets, ip_to_lookup)
+
+    def handle_port_command(self, port: str, node_id: Optional[str] = None, node_name: Optional[str] = None):
+        """Search for bindings on a physical port."""
+        port_str = f"eth{port}"
+
+        # Resolve pod and node
+        top_data = self.cached_api("/api/node/class/topSystem.json")
+        result = self.get_pod_for_node(top_data, node_id, node_name)
+        if not result:
+            print(f"Error: Could not find pod for node {node_id} ({node_name})")
+            exit(1)
+        pod_id, node_id = result
+
+        # Fetch bindings
+        static_bindings = self.cached_api("/api/node/class/fvRsPathAtt.json")
+        svi_bindings = self.cached_api("/api/class/l3extRsPathL3OutAtt.json")
+
+        tree = {}
+
+        # Helper to process bindings
+        def process_bindings(bindings, regex, category_func, label_func):
+            for item in bindings:
+                attr = next(iter(item.values()))['attributes']
+                dn = attr.get("dn", "")
+                tDn = attr.get("tDn", "")
+                encap = attr.get("encap", "")
+
+                if f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{port_str}]" not in tDn:
+                    continue
+
+                match = parse_regex(regex, dn)
+                if match:
+                    tenant = match["tenant"]
+                    category = category_func(match)
+                    label = label_func(match, encap)
+                    self.tree_add(tree, tenant, category, label=label)
+
+        # Process L2 (EPG) bindings
+        process_bindings(
+            static_bindings,
+            RE_EPG,
+            category_func=lambda m: f"EPG: {m['ap']}",
+            label_func=lambda m, encap: f"{m['epg']} ({encap})"
+        )
+
+        # Process L3 (SVI / L3Out) bindings
+        process_bindings(
+            svi_bindings,
+            RE_L3OUT_PATH,
+            category_func=lambda m: f"L3: {m['out']}",
+            label_func=lambda m, encap: f"{m['lifp']} ({encap})"
+        )
+
+        # Print results
+        device = self.normalize_node_label(pod_id, node_id)
+        if tree:
+            print(f"\nBindings for {port_str} on {device}:")
+            self.print_tree(tree)
+        else:
+            print(f"\nNo bindings found for {port_str} on {device}.")
+
+    def handle_vpc_command(self, nodes: str, interface: Optional[str] = None):
+        """Search for bindings on a VPC interface."""
+        tree = {}
+
+        # Parse node pair
+        try:
+            node1, node2 = map(int, nodes.split('-'))
+        except ValueError:
+            print(f"Error: Invalid node pair format '{nodes}'. Expected format: 221-222")
+            exit(1)
+
+        # Find pod ID
+        top_data = self.cached_api("/api/node/class/topSystem.json")
+        pod_id = None
+        for item in top_data:
+            attr = item.get("topSystem", {}).get("attributes", {})
+            if attr.get("id") == str(node1):
+                pod_id = attr.get("podId")
+                break
+
+        if not pod_id:
+            print(f"Error: Could not find pod for node {node1}")
+            exit(1)
+
+        # If no interface specified, list all VPCs
+        if not interface:
+            all_bindings = self.cached_api("/api/node/class/fvRsPathAtt.json")
+            vpc_list = set()
+            vpc_prefix = f"topology/pod-{pod_id}/protpaths-{node1}-{node2}/pathep-["
+
+            for item in all_bindings:
+                attr = item.get("fvRsPathAtt", {}).get("attributes", {})
+                tDn = attr.get("tDn", "")
+                if vpc_prefix in tDn:
+                    vpc_name = tDn.split("pathep-[")[-1].split("]")[0]
+                    vpc_list.add(vpc_name)
+
+            if vpc_list:
+                print(f"\nVPCs on nodes {nodes}:")
+                for vpc in sorted(vpc_list):
+                    print(f"  {vpc}")
+            else:
+                print(f"\nNo VPCs found on nodes {nodes}.")
+            return
+
+        vpc_pattern = f"topology/pod-{pod_id}/protpaths-{node1}-{node2}/pathep-[{interface}]"
+
+        # L2 (Static Path) Bindings
+        static_bindings = self.cached_api("/api/node/class/fvRsPathAtt.json")
+        for item in static_bindings:
             attr = item.get("fvRsPathAtt", {}).get("attributes", {})
             tDn = attr.get("tDn", "")
+            dn = attr.get("dn", "")
+            encap = attr.get("encap", "")
 
-            if vpc_prefix in tDn:
-                # extract vpc name inside pathep-[XXX]
-                vpc_name = tDn.split("pathep-[")[-1].split("]")[0]
-                vpc_list.add(vpc_name)
-
-        if vpc_list:
-            print(f"\nVPCs on nodes {nodes}:")
-            for vpc in sorted(vpc_list):
-                    print(f"  {vpc}")
-        else:
-            print(f"\nNo VPCs found on nodes {nodes}.")
-
-        return
-
-    # -----------------------------
-    # 3. L2 (Static Path) Bindings
-    # -----------------------------
-    static_bindings = apic.cached_api("/api/node/class/fvRsPathAtt.json")
-    for item in static_bindings:
-        attr = item.get("fvRsPathAtt", {}).get("attributes", {})
-        tDn = attr.get("tDn", "")
-        dn = attr.get("dn", "")
-        encap = attr.get("encap", "")
-
-        if vpc_pattern not in tDn:
-            continue
-
-        match = parse_regex(RE_EPG, dn)
-        if match:
-            tenant = match["tenant"]
-            category = f"EPG: {match['ap']}"
-            apic.tree_add(
-                tree,
-                tenant,
-                category,
-                label = f"{match['epg']} ({encap})"
-            )
-
-
-    # -----------------------------
-    # 4. L3 (SVI / L3Out) Bindings
-    # -----------------------------
-    svi_bindings = apic.cached_api("/api/class/l3extRsPathL3OutAtt.json") 
-    for item in svi_bindings:
-        attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
-        tDn = attr.get("tDn", "")
-        dn = attr.get("dn", "")
-        encap = attr.get("encap", "")
-
-        if vpc_pattern not in tDn:
-            continue
-
-        match = parse_regex(RE_L3OUT_PATH, dn)
-        if match:
-            tenant = match["tenant"]
-            category = f"L3: {match['out']}"
-            label = f"{match['lifp']} ({encap})"
-            apic.tree_add(tree, tenant, category, label=label)
-
-
-    # -----------------------------
-    # 5. Print Results
-    # -----------------------------
-    device = apic.normalize_node_label(pod_id, nodes)
-    if tree:
-        print(f"\nBindings for VPC {interface} on {device[0]}:")
-        apic.print_tree(tree)
-    else:
-        print(f"\nNo bindings found for VPC {interface} on {device[0]}.")
-
-def handle_vlan_command(apic, vlan_id):
-    tree = {}
-    vlan_str = f"vlan-{vlan_id}"
-
-    # -----------------------------
-    # 1. EPG Bindings
-    # -----------------------------
-    epg_bindings = apic.get_api(
-        f"/api/node/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.encap,\"{vlan_str}\")"
-    )
-    for item in epg_bindings:
-        attr = item.get("fvRsPathAtt", {}).get("attributes", {})
-        dn = attr.get("dn", "")
-        encap = attr.get("encap", "")
-
-        match = RE_EPG.search(dn)
-        if match:
-            tenant = match["tenant"]
-            category = f"EPG: {match['ap']}"
-            apic.tree_add(
-                tree,
-                tenant,
-                category,
-                label = f"{match['epg']} ({encap})"
-            )
-
-    # -----------------------------
-    # 2. L3Out Bindings
-    # -----------------------------
-    l3out_paths = apic.get_api(
-        f"/api/class/l3extRsPathL3OutAtt.json?query-target-filter=eq(l3extRsPathL3OutAtt.encap,\"{vlan_str}\")"
-    )
-    for item in l3out_paths:
-        attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
-        dn = attr.get("dn", "")
-        encap = attr.get("encap", "")
-
-        match = RE_L3OUT_PATH.search(dn)
-        if match:
-            tenant = match["tenant"]
-            category = f"L3: {match['out']}"
-            apic.tree_add(
-                tree,
-                tenant,
-                category,
-                label = f"{match['lifp']} ({encap})"
-            )
-
-    # -----------------------------
-    # 3. Dynamic EPG Members
-    # -----------------------------
-    endpoints = apic.get_api(
-        f"/api/class/fvCEp.json?query-target-filter=eq(fvCEp.encap,\"{vlan_str}\")"
-    )
-    for item in endpoints:
-        attr = item.get("fvCEp", {}).get("attributes", {})
-        dn = attr.get("dn", "")
-        encap = attr.get("encap", "")
-
-        match = RE_CEP.search(dn)
-        if match:
-            tenant = match["tenant"]
-            category = f"EPG: {match['ap']}"
-            apic.tree_add(
-                tree,
-                tenant,
-                category,
-                label = f"{match['epg']} ({encap})"
-            )
-
-
-    # -----------------------------
-    # 4. Print Results
-    # -----------------------------
-    if tree:
-        print(f"\nVLAN {vlan_id} found in:")
-        apic.print_tree(tree)
-    else:
-        print(f"\nVLAN {vlan_id} not found in any EPG or L3Out bindings.")
-
-    # -----------------------------
-    # 5. VLAN Pool Information
-    # -----------------------------
-    vlaninstp = apic.get_api("/api/class/fvnsVlanInstP.json")
-    pools = apic.find_vlan_in_vlan_pools(vlaninstp, vlan_id)
-    if pools:
-        print(f"\nVLAN {vlan_id} found in pools:")
-        for name, dn, v_from, v_to in pools:
-            print(f"  {name} (range: {v_from}–{v_to})")
-    else:
-        print(f"\nVLAN {vlan_id} not found in any VLAN pools.")
-
-def handle_filter_command(apic, contract_name, tenant_filter):
-    print("")
-
-    # Cached API queries
-    contracts      = apic.cached_api("/api/node/class/vzBrCP.json")
-    rs_subj_filt   = apic.cached_api("/api/node/class/vzRsSubjFiltAtt.json")
-    filters        = apic.cached_api("/api/node/class/vzFilter.json")
-    filter_entries = apic.cached_api("/api/node/class/vzEntry.json")
-    subjects       = apic.cached_api("/api/node/class/vzSubj.json")
-
-    # -----------------------------
-    # Find contract DN in specified tenant
-    # -----------------------------
-    tenant_dn_prefix = f"uni/tn-{tenant_filter}/"
-    contract_dn = None
-    for item in contracts:
-        attr = item["vzBrCP"]["attributes"]
-        if attr["name"] == contract_name and attr["dn"].startswith(tenant_dn_prefix):
-            contract_dn = attr["dn"]
-            break
-
-    if not contract_dn:
-        print(f"❌ Contract '{contract_name}' not found in tenant '{tenant_filter}'.")
-        return
-
-    # -----------------------------
-    # Collect filters assigned to this contract
-    # -----------------------------
-    used_filters = set()
-    for subj_item in subjects:
-        subj_attr = subj_item["vzSubj"]["attributes"]
-        dn = subj_attr["dn"]
-        if not dn.startswith(contract_dn + "/subj-"):
-            continue
-
-        # Follow the relationships from subject to filter (tDn)
-        for rel in rs_subj_filt:
-            rattr = rel.get("vzRsSubjFiltAtt", {}).get("attributes", {})
-            if rattr.get("dn", "").startswith(dn):
-                filter_name = rattr.get("tDn", "").split("/")[-1].replace("flt-", "")
-                used_filters.add(filter_name)
-
-    if not used_filters:
-        print(f"⚠️ No filters attached to contract '{contract_name}'")
-        return
-
-    # -----------------------------
-    # Build filter details
-    # -----------------------------
-    filters_detail_node = {}
-
-    for f_item in filters:
-        fattr = f_item.get("vzFilter", {}).get("attributes", {})
-        f_name = fattr.get("name")
-        f_dn   = fattr.get("dn")
-
-        if f_name not in used_filters:
-            continue
-
-        rules = []
-        for entry in filter_entries:
-            eattr = entry.get("vzEntry", {}).get("attributes", {})
-            e_dn = eattr.get("dn", "")
-
-            if not e_dn.startswith(f_dn + "/e-"):
+            if vpc_pattern not in tDn:
                 continue
 
-            def norm(v):
-                return "any" if v in (None, "unspecified") else v
+            match = parse_regex(RE_EPG, dn)
+            if match:
+                tenant = match["tenant"]
+                category = f"EPG: {match['ap']}"
+                self.tree_add(
+                    tree,
+                    tenant,
+                    category,
+                    label=f"{match['epg']} ({encap})"
+                )
 
-            proto = norm(eattr.get("prot"))
-            sF, sT = norm(eattr.get("sFromPort")), norm(eattr.get("sToPort"))
-            dF, dT = norm(eattr.get("dFromPort")), norm(eattr.get("dToPort"))
+        # L3 (SVI / L3Out) Bindings
+        svi_bindings = self.cached_api("/api/class/l3extRsPathL3OutAtt.json")
+        for item in svi_bindings:
+            attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
+            tDn = attr.get("tDn", "")
+            dn = attr.get("dn", "")
+            encap = attr.get("encap", "")
 
-            def compact(a, b):
-                return a if a == b else f"{a}-{b}"
+            if vpc_pattern not in tDn:
+                continue
 
-            sPort = compact(sF, sT)
-            dPort = compact(dF, dT)
+            match = parse_regex(RE_L3OUT_PATH, dn)
+            if match:
+                tenant = match["tenant"]
+                category = f"L3: {match['out']}"
+                label = f"{match['lifp']} ({encap})"
+                self.tree_add(tree, tenant, category, label=label)
 
-            if sPort == "any" and dPort == "any":
-                rule = f"{proto} any"
-            elif sPort == "any":
-                rule = f"{proto} dst:{dPort}"
-            elif dPort == "any":
-                rule = f"{proto} src:{sPort}"
-            else:
-                rule = f"{proto} src:{sPort} dst:{dPort}"
+        # Print Results
+        device = self.normalize_node_label(pod_id, nodes)
+        if tree:
+            print(f"\nBindings for VPC {interface} on {device[0]}:")
+            self.print_tree(tree)
+        else:
+            print(f"\nNo bindings found for VPC {interface} on {device[0]}.")
 
-            rules.append(rule)
+    def handle_vlan_command(self, vlan_id: int):
+        """Search for VLAN usage in EPGs, L3Outs, and VLAN pools."""
+        tree = {}
+        vlan_str = f"vlan-{vlan_id}"
 
-        filters_detail_node[f_name] = rules
+        # EPG Bindings
+        epg_bindings = self.get_api(
+            f"/api/node/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.encap,\"{vlan_str}\")"
+        )
+        for item in epg_bindings:
+            attr = item.get("fvRsPathAtt", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            encap = attr.get("encap", "")
 
-    # -----------------------------
-    # Print the result
-    # -----------------------------
-    tree = {contract_name: {"Filter Details": filters_detail_node}}
-    apic.print_tree(tree)
+            match = RE_EPG.search(dn)
+            if match:
+                tenant = match["tenant"]
+                category = f"EPG: {match['ap']}"
+                self.tree_add(
+                    tree,
+                    tenant,
+                    category,
+                    label=f"{match['epg']} ({encap})"
+                )
 
-def handle_subnet_command(apic, tenant_filter=None, prefix_filter=None):
-    apic.list_all_subnets(tenant_filter, prefix_filter)
+        # L3Out Bindings
+        l3out_paths = self.get_api(
+            f"/api/class/l3extRsPathL3OutAtt.json?query-target-filter=eq(l3extRsPathL3OutAtt.encap,\"{vlan_str}\")"
+        )
+        for item in l3out_paths:
+            attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            encap = attr.get("encap", "")
+
+            match = RE_L3OUT_PATH.search(dn)
+            if match:
+                tenant = match["tenant"]
+                category = f"L3: {match['out']}"
+                self.tree_add(
+                    tree,
+                    tenant,
+                    category,
+                    label=f"{match['lifp']} ({encap})"
+                )
+
+        # Dynamic EPG Members
+        endpoints = self.get_api(
+            f"/api/class/fvCEp.json?query-target-filter=eq(fvCEp.encap,\"{vlan_str}\")"
+        )
+        for item in endpoints:
+            attr = item.get("fvCEp", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            encap = attr.get("encap", "")
+
+            match = RE_CEP.search(dn)
+            if match:
+                tenant = match["tenant"]
+                category = f"EPG: {match['ap']}"
+                self.tree_add(
+                    tree,
+                    tenant,
+                    category,
+                    label=f"{match['epg']} ({encap})"
+                )
+
+        # Print Results
+        if tree:
+            print(f"\nVLAN {vlan_id} found in:")
+            self.print_tree(tree)
+        else:
+            print(f"\nVLAN {vlan_id} not found in any EPG or L3Out bindings.")
+
+        # VLAN Pool Information
+        vlaninstp = self.get_api("/api/class/fvnsVlanInstP.json")
+        pools = self.find_vlan_in_vlan_pools(vlaninstp, vlan_id)
+        if pools:
+            print(f"\nVLAN {vlan_id} found in pools:")
+            for name, dn, v_from, v_to in pools:
+                print(f"  {name} (range: {v_from}–{v_to})")
+        else:
+            print(f"\nVLAN {vlan_id} not found in any VLAN pools.")
+
+    def handle_filter_command(self, contract_name: str, tenant_filter: str):
+        """Display filter details for a contract."""
+        print("")
+
+        # Cached API queries
+        contracts = self.cached_api("/api/node/class/vzBrCP.json")
+        rs_subj_filt = self.cached_api("/api/node/class/vzRsSubjFiltAtt.json")
+        filters = self.cached_api("/api/node/class/vzFilter.json")
+        filter_entries = self.cached_api("/api/node/class/vzEntry.json")
+        subjects = self.cached_api("/api/node/class/vzSubj.json")
+
+        # Find contract DN in specified tenant
+        tenant_dn_prefix = f"uni/tn-{tenant_filter}/"
+        contract_dn = None
+        for item in contracts:
+            attr = item["vzBrCP"]["attributes"]
+            if attr["name"] == contract_name and attr["dn"].startswith(tenant_dn_prefix):
+                contract_dn = attr["dn"]
+                break
+
+        if not contract_dn:
+            print(f"❌ Contract '{contract_name}' not found in tenant '{tenant_filter}'.")
+            return
+
+        # Collect filters assigned to this contract
+        used_filters = set()
+        for subj_item in subjects:
+            subj_attr = subj_item["vzSubj"]["attributes"]
+            dn = subj_attr["dn"]
+            if not dn.startswith(contract_dn + "/subj-"):
+                continue
+
+            for rel in rs_subj_filt:
+                rattr = rel.get("vzRsSubjFiltAtt", {}).get("attributes", {})
+                if rattr.get("dn", "").startswith(dn):
+                    filter_name = rattr.get("tDn", "").split("/")[-1].replace("flt-", "")
+                    used_filters.add(filter_name)
+
+        if not used_filters:
+            print(f"⚠️ No filters attached to contract '{contract_name}'")
+            return
+
+        # Build filter details
+        filters_detail_node = {}
+
+        for f_item in filters:
+            fattr = f_item.get("vzFilter", {}).get("attributes", {})
+            f_name = fattr.get("name")
+            f_dn = fattr.get("dn")
+
+            if f_name not in used_filters:
+                continue
+
+            rules = []
+            for entry in filter_entries:
+                eattr = entry.get("vzEntry", {}).get("attributes", {})
+                e_dn = eattr.get("dn", "")
+
+                if not e_dn.startswith(f_dn + "/e-"):
+                    continue
+
+                def norm(v):
+                    return "any" if v in (None, "unspecified") else v
+
+                proto = norm(eattr.get("prot"))
+                sF, sT = norm(eattr.get("sFromPort")), norm(eattr.get("sToPort"))
+                dF, dT = norm(eattr.get("dFromPort")), norm(eattr.get("dToPort"))
+
+                def compact(a, b):
+                    return a if a == b else f"{a}-{b}"
+
+                sPort = compact(sF, sT)
+                dPort = compact(dF, dT)
+
+                if sPort == "any" and dPort == "any":
+                    rule = f"{proto} any"
+                elif sPort == "any":
+                    rule = f"{proto} dst:{dPort}"
+                elif dPort == "any":
+                    rule = f"{proto} src:{sPort}"
+                else:
+                    rule = f"{proto} src:{sPort} dst:{dPort}"
+
+                rules.append(rule)
+
+            filters_detail_node[f_name] = rules
+
+        # Print the result
+        tree = {contract_name: {"Filter Details": filters_detail_node}}
+        self.print_tree(tree)
+
+    def handle_subnet_command(self, tenant_filter: Optional[str] = None, prefix_filter: Optional[str] = None):
+        """List all subnets in the ACI fabric."""
+        self.list_all_subnets(tenant_filter, prefix_filter)
+
+    @staticmethod
+    def print_tree(tree, label=None):
+        """Print tree structure (backward compatibility wrapper)."""
+        ACITreeBuilder.print_tree(tree, label)
+
+
+# =========================================================================
+# Main Function
+# =========================================================================
 
 def main():
+    """Main entry point for the ACI tool."""
     load_dotenv()
     url = os.environ.get('APIC_URL')
 
@@ -1481,22 +1341,23 @@ def main():
     apic = ACIClient(url)
     apic.login()
 
+    # Dispatch to appropriate command handler method
     if args.command == "ip":
-        handle_ip_command(apic, args.ip)
+        apic.handle_ip_command(args.ip)
     elif args.command == "port":
-        handle_port_command(apic, args)
+        apic.handle_port_command(args.port, args.id, args.name)
     elif args.command == "vpc":
-        handle_vpc_command(apic, args)
+        apic.handle_vpc_command(args.nodes, args.interface)
     elif args.command == "vlan":
-        handle_vlan_command(apic, int(args.vlan))
+        apic.handle_vlan_command(int(args.vlan))
     elif args.command == "tenant":
-        handle_tenant_command(apic, args.tenant)
+        apic.handle_tenant_command(args.tenant)
     elif args.command == "clean":
-        handle_clean_command(apic, args.clean_cmd)
+        apic.handle_clean_command(args.clean_cmd)
     elif args.command == "contract":
-        handle_contract_command(apic, args.contract, args.tenant)
+        apic.handle_contract_command(args.contract, args.tenant)
     elif args.command == "subnet":
-        handle_subnet_command(apic, args.tenant, args.prefix)
+        apic.handle_subnet_command(args.tenant, args.prefix)
 
 if __name__ == "__main__":
     main()
