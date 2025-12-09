@@ -13,18 +13,49 @@ All commands share the same goals:
 
 ## Installation
 
+There are two ways to install and use the ACI Tool:
+
+### Option 1: Container Deployment (Recommended)
+
+The easiest way to deploy this tool is using the provided container script. This will build a Docker/Podman container that handles all dependencies and creates an alias for easy command execution from the host.
+
 ```bash
 git clone <your-repo>
-cd python
+cd acitool
+./deploy_container.sh
+```
+
+**What this does:**
+- Builds a Docker/Podman container with all required dependencies
+- Creates an alias `acitool` that executes commands from the host directly into the container
+- Isolates the tool environment from your system Python installation
+- No manual dependency management required
+
+After deployment, simply use:
+```bash
+acitool <command> [args]
+```
+
+### Option 2: Manual Python Environment
+
+If you prefer to run the tool directly with Python or want to customize the environment:
+
+```bash
+git clone <your-repo>
+cd acitool/scripts
 python3 -m pip install -r requirements.txt
 ```
 
-### Requirements
+Then run commands directly:
+```bash
+python3 acitool.py <command> [args]
+```
 
+**Requirements:**
 - Python 3.7+
 - requests
 - urllib3
-- python-dotenv (optional, for environment-based authentication)
+- python-dotenv
 
 ---
 
@@ -51,8 +82,10 @@ Authentication tokens are cached in `~/.aci_token` by default to avoid repeated 
 # Usage
 
 ```bash
-python3 acitool.py <command> [args]
+acitool <command> [args]
 ```
+
+> **Note:** If using Option 2 (Manual Python), replace `acitool` with `python3 scripts/acitool.py` in all examples below.
 
 ### SSL Verification
 
@@ -81,7 +114,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 Run:
 
 ```bash
-python3 acitool.py clean <vrf|bd|epg|empty|aaep|vlan>
+acitool clean <vrf|bd|epg|empty|aaep|vlan>
 ```
 
 ---
@@ -145,7 +178,7 @@ Finds **VLAN pools that are not referenced by any domain or AAEP**.
 # CONTRACT COMMAND
 
 ```bash
-python3 acitool.py contract <contract-name> [--tenant TENANT]
+acitool contract <contract-name> [--tenant TENANT]
 ```
 
 ### Features:
@@ -162,7 +195,7 @@ python3 acitool.py contract <contract-name> [--tenant TENANT]
 # TENANT COMMAND
 
 ```bash
-python3 acitool.py tenant <tenant>
+acitool tenant <tenant>
 ```
 
 Shows:
@@ -180,7 +213,7 @@ Again grouped by pod/node/interface.
 # IP LOOKUP
 
 ```bash
-python3 acitool.py ip <ip-address>
+acitool ip <ip-address>
 ```
 
 Finds:
@@ -197,7 +230,7 @@ Finds:
 # PORT LOOKUP
 
 ```bash
-python3 acitool.py port --id <node> --port <x/y>
+acitool port --id <node> --port <x/y>
 ```
 
 Shows **all bindings on physical port ethX/Y**:
@@ -214,13 +247,13 @@ Grouped by tenant and AP/L3Out.
 ## List VPCs on node pair:
 
 ```bash
-python3 acitool.py vpc --nodes 221-222
+acitool vpc <nodeA>-<NodeB>
 ```
 
 ## Show bindings on a specific VPC:
 
 ```bash
-python3 acitool.py vpc --nodes 221-222 <vpc_name>
+acitool vpc 201-202 <vpc_name>
 ```
 
 Shows EPG and L3Out bindings.
@@ -230,7 +263,7 @@ Shows EPG and L3Out bindings.
 # VLAN LOOKUP
 
 ```bash
-python3 acitool.py vlan <vlan-id>
+acitool vlan <vlan-id>
 ```
 
 Shows:
@@ -246,9 +279,9 @@ Shows:
 # SUBNET LISTING
 
 ```bash
-python3 acitool.py subnet
-python3 acitool.py subnet --tenant TenantA
-python3 acitool.py subnet --prefix /30
+acitool subnet
+acitool subnet --tenant TenantA
+acitool subnet --prefix /30
 ```
 
 Shows all subnets in the fabric, including:
@@ -303,43 +336,43 @@ Filters can be applied by tenant or prefix pattern.
 ## Find all unused EPGs in a specific tenant
 
 ```bash
-python3 scripts/aci.py clean epg
+acitool clean epg
 ```
 
 ## Check all bindings on a specific port
 
 ```bash
-python3 scripts/aci.py port 1/10 --id 201
+acitool port 1/10 --id 201
 ```
 
 ## Find what VLAN pools contain VLAN 100
 
 ```bash
-python3 scripts/aci.py vlan 100
+acitool vlan 100
 ```
 
 ## Look up where an IP address is used
 
 ```bash
-python3 scripts/aci.py ip 10.1.1.1
+acitool ip 10.1.1.1
 ```
 
 ## Show all contracts in a tenant with their filters
 
 ```bash
-python3 scripts/aci.py contract web-contract --tenant production
+acitool contract web-contract --tenant production
 ```
 
 ## Find all VPC interfaces on node pair
 
 ```bash
-python3 scripts/aci.py vpc 201-202
+acitool vpc 201-202
 ```
 
 ## List all L3Out subnets in a specific tenant
 
 ```bash
-python3 scripts/aci.py subnet --tenant external
+acitool subnet --tenant external
 ```
 
 ---
