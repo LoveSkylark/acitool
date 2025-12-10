@@ -4,12 +4,12 @@ acitool() {
         return 1
     fi
 
-    # Check if we already detected the container runtime
-    if [ -z "$CONTAINER_CMD" ]; then
-        # First time - detect and cache the result
-        if type -P podman >/dev/null 2>&1; then
+    # Check if CONTAINER_CMD is already set to a valid value
+    if [ "$CONTAINER_CMD" != "podman" ] && [ "$CONTAINER_CMD" != "docker" ]; then
+        # Detect and cache container runtime
+        if command -v podman >/dev/null 2>&1; then
             export CONTAINER_CMD="podman"
-        elif type -P docker >/dev/null 2>&1; then
+        elif command -v docker >/dev/null 2>&1; then
             export CONTAINER_CMD="docker"
         else
             echo "Error: Neither podman nor docker is installed."
@@ -19,6 +19,7 @@ acitool() {
 
     # Start container if it's not running
     if ! $CONTAINER_CMD ps --format '{{.Names}}' | grep -q '^acitool$'; then
+        echo "Starting acitool container..."
         $CONTAINER_CMD start acitool >/dev/null 2>&1
     fi
 
