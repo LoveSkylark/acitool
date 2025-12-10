@@ -101,19 +101,73 @@ if [ -n "$BASH_VERSION" ]; then
 elif [ -n "$ZSH_VERSION" ]; then
     PROFILE_FILE="$HOME/.zshrc"
 else
-    echo "  ⚠ Unknown shell. Please manually add this alias to your profile:"
-    echo "    alias acitool='$CONTAINER_CMD exec -it acitool python3 /app/acitool.py'"
+    echo "  ⚠ Unknown shell. Please manually add this function to your profile:"
+    cat << 'EOF'
+    acitool() {
+        if [ $# -eq 0 ]; then
+            echo "No arguments provided. Use --help for help."
+            return 1
+        fi
+
+        # Check if we already detected the container runtime
+        if [ -z "$CONTAINER_CMD" ]; then
+            # First time - detect and cache the result
+            if type -P podman >/dev/null 2>&1; then
+                export CONTAINER_CMD="podman"
+            elif type -P docker >/dev/null 2>&1; then
+                export CONTAINER_CMD="docker"
+            else
+                echo "Error: Neither podman nor docker is installed."
+                return 1
+            fi
+        fi
+
+        # Start container if it's not running
+        if ! $CONTAINER_CMD ps --format '{{.Names}}' | grep -q '^acitool$'; then
+            $CONTAINER_CMD start acitool >/dev/null 2>&1
+        fi
+
+        $CONTAINER_CMD exec -it acitool python3 /app/acitool.py "$@"
+    }
+EOF
 fi
 
 if [ -n "$PROFILE_FILE" ]; then
-    # Check if alias already exists
-    if grep -q "alias acitool=" "$PROFILE_FILE" 2>/dev/null; then
-        echo "  ℹ Alias already exists in $PROFILE_FILE"
+    # Check if function already exists
+    if grep -q "acitool()" "$PROFILE_FILE" 2>/dev/null; then
+        echo "  ℹ Function already exists in $PROFILE_FILE"
     else
         echo "" >> "$PROFILE_FILE"
-        echo "# ACI Tool alias" >> "$PROFILE_FILE"
-        echo "alias acitool='$CONTAINER_CMD exec -it acitool python3 /app/acitool.py'" >> "$PROFILE_FILE"
-        echo "✓ Alias added to $PROFILE_FILE"
+        echo "# ACI Tool function" >> "$PROFILE_FILE"
+        cat << 'EOF' >> "$PROFILE_FILE"
+acitool() {
+    if [ $# -eq 0 ]; then
+        echo "No arguments provided. Use --help for help."
+        return 1
+    fi
+
+    # Check if we already detected the container runtime
+    if [ -z "$CONTAINER_CMD" ]; then
+        # First time - detect and cache the result
+        if type -P podman >/dev/null 2>&1; then
+            export CONTAINER_CMD="podman"
+        elif type -P docker >/dev/null 2>&1; then
+            export CONTAINER_CMD="docker"
+        else
+            echo "Error: Neither podman nor docker is installed."
+            return 1
+        fi
+    fi
+
+    # Start container if it's not running
+    if ! $CONTAINER_CMD ps --format '{{.Names}}' | grep -q '^acitool$'; then
+        $CONTAINER_CMD start acitool >/dev/null 2>&1
+    fi
+
+    $CONTAINER_CMD exec -it acitool python3 /app/acitool.py "$@"
+}
+EOF
+        echo "✓ Function added to $PROFILE_FILE"
     fi
 fi
 
