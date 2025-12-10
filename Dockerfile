@@ -36,5 +36,5 @@ USER aciuser
 # Set the entrypoint
 ENTRYPOINT ["python3", "/app/acitool.py"]
 
-# Default command (show help)
-CMD ["--help"]
+# Default command
+CMD ["tail", "-f", "/dev/null"]
