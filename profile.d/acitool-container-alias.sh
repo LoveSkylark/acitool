@@ -1,6 +1,6 @@
 acitool() {
     if [ $# -eq 0 ]; then
-        echo "No arguments provided. Use -h for help."
+        echo "No arguments provided. Use --help for help."
         return 1
     fi
 
@@ -17,6 +17,10 @@ acitool() {
         fi
     fi
 
-    $CONTAINER_CMD start "python" >/dev/null 2>&1
-    $CONTAINER_CMD exec -it "python" python3 /scripts/acitool.py "$@"
+    # Start container if it's not running
+    if ! $CONTAINER_CMD ps --format '{{.Names}}' | grep -q '^acitool$'; then
+        $CONTAINER_CMD start acitool >/dev/null 2>&1
+    fi
+
+    $CONTAINER_CMD exec -it acitool python3 /app/acitool.py "$@"
 }

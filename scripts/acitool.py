@@ -25,9 +25,12 @@ from aci_parsers import (
     RE_VRF, RE_BD, RE_EPG, RE_EPG_DN, RE_CEP,
     RE_L3OUT, RE_L3OUT_DN, RE_L3OUT_PATH,
     RE_PATH_TDN, RE_AAEP_TDN, RE_VLAN_POOL_TDN,
-    parse_regex, extract_tenant_from_dn, format_epg_label
+    parse_regex, extract_tenant_from_dn, format_epg_label,
+    parse_epg_binding, parse_l3out_binding, parse_path_info,
+    parse_vrf_info, parse_bd_info, parse_subnet_info, parse_endpoint_info
 )
 from aci_tree import ACITreeBuilder
+from aci_models import VLANPoolRange
 
 # Configure logging
 logging.basicConfig(
@@ -71,12 +74,14 @@ def parse_args():
     clean_sub.add_parser("bd",  help="List BDs with no EPG or L3Out attached")
     clean_sub.add_parser("epg", help="List EPGs without contracts, members, or static bindings")
     clean_sub.add_parser("empty", help="List EPGs with no MAC, IP addresses, or static bindings")
+    clean_sub.add_parser("subnet", help="List all subnets in the fabric")
 
     contract_parser = subparsers.add_parser("contract", help="Contract lookup")
     contract_parser.add_argument("contract", help="Contract name")
     contract_parser.add_argument("-t", "--tenant", help="Only search inside this tenant")
 
     subnet_parser = subparsers.add_parser("subnet", help="List all subnets in use in the ACI fabric")
+    subnet_parser.add_argument("cidr", nargs="?", default=None, help="Optional CIDR to filter subnets within (e.g., 10.1.0.0/16)")
     subnet_parser.add_argument("-t", "--tenant", help="Filter by tenant name", default=None)
     subnet_parser.add_argument("-p", "--prefix", help="Filter by subnet mask (e.g., /24, /30)", default=None)
 
@@ -147,6 +152,12 @@ class ACIClient:
         username = os.environ.get('APIC_USERNAME')
         password = os.environ.get('APIC_PASSWORD')
 
+        # Filter out empty strings and None values
+        if not username or not username.strip():
+            username = None
+        if not password or not password.strip():
+            password = None
+
         if not username or not password:
             username, password = self.prompt_credentials()
 
@@ -164,7 +175,22 @@ class ACIClient:
             self.save_token_to_file()
         except requests.RequestException as e:
             logger.error(f"Login failed: {e}")
-            exit(1)
+            logger.info("Please verify your credentials and try again.")
+            # If login fails, clear cached credentials and retry with prompt
+            username, password = self.prompt_credentials()
+            payload = {
+                "aaaUser": {"attributes": {"name": username, "pwd": password}}
+            }
+            try:
+                response = self.session.post(f"{self.apic_url}/api/aaaLogin.json", json=payload, verify=self.verify_ssl)
+                response.raise_for_status()
+                json_data = response.json()
+                self.token = json_data["imdata"][0]["aaaLogin"]["attributes"]["token"]
+                self.session.cookies["APIC-cookie"] = self.token
+                self.save_token_to_file()
+            except requests.RequestException as retry_error:
+                logger.error(f"Login failed again: {retry_error}")
+                exit(1)
         except (KeyError, IndexError, TypeError) as e:
             logger.error(f"Unexpected login response format: {e}")
             exit(1)
@@ -214,7 +240,7 @@ class ACIClient:
             if dn_match and fp_match:
                 print(f"IP found in:")
                 print(f"  {dn_match['tenant']}\n    AP:{dn_match['ap']}\n      {dn_match['epg']}\n")
-                print(f"  Physical location: Pod-{fp_match['pod']}, Node-{fp_match['node']} MAC:[{dn_match['mac']}]")
+                print(f"  Physical location: Pod-{fp_match['pod']}, Node-{fp_match['node']} MAC:[{dn_match['cep']}]")
                 print(f"  Interface Selector: {fp_match['pathep']}")
                 found = True
 
@@ -323,10 +349,10 @@ class ACIClient:
         else:
             return False
 
-    def find_vlan_in_vlan_pools(self, pools, vlan_id):
+    def find_vlan_in_vlan_pools(self, pools, vlan_id) -> List[VLANPoolRange]:
         """
         Check which VLAN pools contain the specified VLAN ID.
-        Returns a list of tuples: (pool_name, pool_dn, from_vlan, to_vlan)
+        Returns a list of VLANPoolRange objects.
         """
         results = []
 
@@ -349,7 +375,13 @@ class ACIClient:
                     continue  # skip malformed entries
 
                 if from_vlan <= vlan_id <= to_vlan:
-                    results.append((pool_name, blk_attrs["dn"], from_vlan, to_vlan))
+                    pool_range = VLANPoolRange(
+                        pool_name=pool_name,
+                        pool_dn=blk_attrs["dn"],
+                        from_vlan=from_vlan,
+                        to_vlan=to_vlan
+                    )
+                    results.append(pool_range)
 
         return results
 
@@ -439,19 +471,41 @@ class ACIClient:
             return last.split("-", 1)[-1]
         return last
 
-    def list_all_subnets(self, tenant_filter=None, prefix_filter=None):
+    def list_all_subnets(self, tenant_filter=None, prefix_filter=None, cidr_filter=None):
         """
-        List all subnets in use in the ACI fabric (BD + L3Out), optionally filter by tenant and subnet mask.
+        List all subnets in use in the ACI fabric (BD + L3Out), optionally filter by tenant, subnet mask, or CIDR range.
         """
         tree = {}
 
-        def subnet_matches(ip_cidr, prefix_filter):
-            if not prefix_filter:
+        # Validate and parse CIDR filter if provided
+        filter_network = None
+        if cidr_filter:
+            try:
+                filter_network = ip_network(cidr_filter, strict=False)
+            except ValueError as e:
+                print(f"Error: Invalid CIDR format '{cidr_filter}': {e}")
+                return
+
+        def subnet_matches(ip_cidr, prefix_filter, cidr_filter_net):
+            """Check if subnet matches prefix and/or CIDR range filters."""
+            if not prefix_filter and not cidr_filter_net:
                 return True
             try:
                 net = ip_network(ip_cidr, strict=False)
-                return net.prefixlen == int(prefix_filter.lstrip("/"))
-            except ValueError:
+
+                # Check prefix filter
+                if prefix_filter and net.prefixlen != int(prefix_filter.lstrip("/")):
+                    return False
+
+                # Check CIDR range filter (only if same IP version)
+                if cidr_filter_net:
+                    if net.version != cidr_filter_net.version:
+                        return False  # Skip mismatched IP versions
+                    if not net.subnet_of(cidr_filter_net):
+                        return False
+
+                return True
+            except (ValueError, TypeError):
                 return False
 
         # -----------------------
@@ -473,7 +527,7 @@ class ACIClient:
             if tenant_filter and tenant != tenant_filter:
                 continue
 
-            if not subnet_matches(ip, prefix_filter):
+            if not subnet_matches(ip, prefix_filter, filter_network):
                 continue
 
             tree.setdefault(tenant, {}).setdefault("BD Subnets:", []).append(f"{bd} - {ip}")
@@ -497,7 +551,7 @@ class ACIClient:
             if tenant_filter and tenant != tenant_filter:
                 continue
 
-            if not subnet_matches(ip, prefix_filter):
+            if not subnet_matches(ip, prefix_filter, filter_network):
                 continue
 
             tree.setdefault(tenant, {}).setdefault("L3Out Subnets:", []).append(f"{l3out} - {ip}")
@@ -506,7 +560,13 @@ class ACIClient:
         # Print result
         # -----------------------
         if tree:
-            self.print_tree(tree, label=f"ACI Subnets in use (BD + L3Out){' - ' + prefix_filter if prefix_filter else ''}:")
+            filters = []
+            if cidr_filter:
+                filters.append(f"within {filter_network}")
+            if prefix_filter:
+                filters.append(f"prefix {prefix_filter}")
+            filter_label = f" ({', '.join(filters)})" if filters else ""
+            self.print_tree(tree, label=f"ACI Subnets in use (BD + L3Out){filter_label}:")
         else:
             print("[!] No subnets found matching the criteria.")
 
@@ -759,6 +819,7 @@ class ACIClient:
             "empty": self.handle_clean_empty,
             "aaep": self.handle_clean_aaep,
             "vlan": self.handle_clean_vlan,
+            "subnet": lambda: self.list_all_subnets(),
         }
 
         handler = handlers.get(clean_cmd)
@@ -909,18 +970,18 @@ class ACIClient:
             tDn = attr.get("tDn", "")
             encap = attr.get("encap", "")
 
-            epg = parse_regex(RE_EPG_DN, dn)
-            path = parse_regex(RE_PATH_TDN, tDn)
+            binding = parse_epg_binding(dn, encap)
+            path = parse_path_info(tDn)
 
-            if not epg or not path:
+            if not binding or not path:
                 continue
 
             self.tree_add(
                 static_tree,
-                f"Pod-{path['pod']}",
-                self.normalize_node_label(path['pod'], path['node']),
-                path['iface'],
-                label=f"{epg['ap']}/{epg['epg']} ({encap})"
+                f"Pod-{path.pod}",
+                self.normalize_node_label(path.pod, path.node),
+                path.interface,
+                label=f"{binding.app_profile}/{binding.epg} ({binding.encap})"
             )
 
         # SVI (L3Out) Bindings
@@ -934,18 +995,18 @@ class ACIClient:
             tDn = attr.get("tDn", "")
             encap = attr.get("encap", "")
 
-            l3 = parse_regex(RE_L3OUT_DN, dn)
-            path = parse_regex(RE_PATH_TDN, tDn)
+            binding = parse_l3out_binding(dn, encap)
+            path = parse_path_info(tDn)
 
-            if not l3 or not path:
+            if not binding or not path:
                 continue
 
             self.tree_add(
                 svi_tree,
-                f"Pod-{path['pod']}",
-                self.normalize_node_label(path['pod'], path['node']),
-                path['iface'],
-                label=f"{l3['l3out']}/{l3['lifp']} ({encap})"
+                f"Pod-{path.pod}",
+                self.normalize_node_label(path.pod, path.node),
+                path.interface,
+                label=f"{binding.l3out}/{binding.interface} ({binding.encap})"
             )
 
         # Output
@@ -1001,40 +1062,37 @@ class ACIClient:
         svi_bindings = self.cached_api("/api/class/l3extRsPathL3OutAtt.json")
 
         tree = {}
-
-        # Helper to process bindings
-        def process_bindings(bindings, regex, category_func, label_func):
-            for item in bindings:
-                attr = next(iter(item.values()))['attributes']
-                dn = attr.get("dn", "")
-                tDn = attr.get("tDn", "")
-                encap = attr.get("encap", "")
-
-                if f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{port_str}]" not in tDn:
-                    continue
-
-                match = parse_regex(regex, dn)
-                if match:
-                    tenant = match["tenant"]
-                    category = category_func(match)
-                    label = label_func(match, encap)
-                    self.tree_add(tree, tenant, category, label=label)
+        port_pattern = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{port_str}]"
 
         # Process L2 (EPG) bindings
-        process_bindings(
-            static_bindings,
-            RE_EPG,
-            category_func=lambda m: f"EPG: {m['ap']}",
-            label_func=lambda m, encap: f"{m['epg']} ({encap})"
-        )
+        for item in static_bindings:
+            attr = next(iter(item.values()))['attributes']
+            dn = attr.get("dn", "")
+            tDn = attr.get("tDn", "")
+            encap = attr.get("encap", "")
+
+            if port_pattern not in tDn:
+                continue
+
+            binding = parse_epg_binding(dn, encap)
+            if binding:
+                category = f"EPG: {binding.app_profile}"
+                self.tree_add(tree, binding.tenant, category, label=f"{binding.epg} ({binding.encap})")
 
         # Process L3 (SVI / L3Out) bindings
-        process_bindings(
-            svi_bindings,
-            RE_L3OUT_PATH,
-            category_func=lambda m: f"L3: {m['out']}",
-            label_func=lambda m, encap: f"{m['lifp']} ({encap})"
-        )
+        for item in svi_bindings:
+            attr = next(iter(item.values()))['attributes']
+            dn = attr.get("dn", "")
+            tDn = attr.get("tDn", "")
+            encap = attr.get("encap", "")
+
+            if port_pattern not in tDn:
+                continue
+
+            binding = parse_l3out_binding(dn, encap)
+            if binding:
+                category = f"L3: {binding.l3out}"
+                self.tree_add(tree, binding.tenant, category, label=f"{binding.interface} ({binding.encap})")
 
         # Print results
         device = self.normalize_node_label(pod_id, node_id)
@@ -1102,15 +1160,14 @@ class ACIClient:
             if vpc_pattern not in tDn:
                 continue
 
-            match = parse_regex(RE_EPG, dn)
-            if match:
-                tenant = match["tenant"]
-                category = f"EPG: {match['ap']}"
+            binding = parse_epg_binding(dn, encap)
+            if binding:
+                category = f"EPG: {binding.app_profile}"
                 self.tree_add(
                     tree,
-                    tenant,
+                    binding.tenant,
                     category,
-                    label=f"{match['epg']} ({encap})"
+                    label=f"{binding.epg} ({binding.encap})"
                 )
 
         # L3 (SVI / L3Out) Bindings
@@ -1124,12 +1181,10 @@ class ACIClient:
             if vpc_pattern not in tDn:
                 continue
 
-            match = parse_regex(RE_L3OUT_PATH, dn)
-            if match:
-                tenant = match["tenant"]
-                category = f"L3: {match['out']}"
-                label = f"{match['lifp']} ({encap})"
-                self.tree_add(tree, tenant, category, label=label)
+            binding = parse_l3out_binding(dn, encap)
+            if binding:
+                category = f"L3: {binding.l3out}"
+                self.tree_add(tree, binding.tenant, category, label=f"{binding.interface} ({binding.encap})")
 
         # Print Results
         device = self.normalize_node_label(pod_id, nodes)
@@ -1153,15 +1208,14 @@ class ACIClient:
             dn = attr.get("dn", "")
             encap = attr.get("encap", "")
 
-            match = RE_EPG.search(dn)
-            if match:
-                tenant = match["tenant"]
-                category = f"EPG: {match['ap']}"
+            binding = parse_epg_binding(dn, encap)
+            if binding:
+                category = f"EPG: {binding.app_profile}"
                 self.tree_add(
                     tree,
-                    tenant,
+                    binding.tenant,
                     category,
-                    label=f"{match['epg']} ({encap})"
+                    label=f"{binding.epg} ({binding.encap})"
                 )
 
         # L3Out Bindings
@@ -1173,15 +1227,14 @@ class ACIClient:
             dn = attr.get("dn", "")
             encap = attr.get("encap", "")
 
-            match = RE_L3OUT_PATH.search(dn)
-            if match:
-                tenant = match["tenant"]
-                category = f"L3: {match['out']}"
+            binding = parse_l3out_binding(dn, encap)
+            if binding:
+                category = f"L3: {binding.l3out}"
                 self.tree_add(
                     tree,
-                    tenant,
+                    binding.tenant,
                     category,
-                    label=f"{match['lifp']} ({encap})"
+                    label=f"{binding.interface} ({binding.encap})"
                 )
 
         # Dynamic EPG Members
@@ -1193,15 +1246,14 @@ class ACIClient:
             dn = attr.get("dn", "")
             encap = attr.get("encap", "")
 
-            match = RE_CEP.search(dn)
-            if match:
-                tenant = match["tenant"]
-                category = f"EPG: {match['ap']}"
+            endpoint = parse_endpoint_info(dn, encap=encap)
+            if endpoint:
+                category = f"EPG: {endpoint.app_profile}"
                 self.tree_add(
                     tree,
-                    tenant,
+                    endpoint.tenant,
                     category,
-                    label=f"{match['epg']} ({encap})"
+                    label=f"{endpoint.epg} ({endpoint.encap})"
                 )
 
         # Print Results
@@ -1216,8 +1268,8 @@ class ACIClient:
         pools = self.find_vlan_in_vlan_pools(vlaninstp, vlan_id)
         if pools:
             print(f"\nVLAN {vlan_id} found in pools:")
-            for name, dn, v_from, v_to in pools:
-                print(f"  {name} (range: {v_from}–{v_to})")
+            for pool_range in pools:
+                print(f"  {pool_range}")
         else:
             print(f"\nVLAN {vlan_id} not found in any VLAN pools.")
 
@@ -1312,9 +1364,9 @@ class ACIClient:
         tree = {contract_name: {"Filter Details": filters_detail_node}}
         self.print_tree(tree)
 
-    def handle_subnet_command(self, tenant_filter: Optional[str] = None, prefix_filter: Optional[str] = None):
+    def handle_subnet_command(self, tenant_filter: Optional[str] = None, prefix_filter: Optional[str] = None, cidr_filter: Optional[str] = None):
         """List all subnets in the ACI fabric."""
-        self.list_all_subnets(tenant_filter, prefix_filter)
+        self.list_all_subnets(tenant_filter, prefix_filter, cidr_filter)
 
     @staticmethod
     def print_tree(tree, label=None):
@@ -1361,7 +1413,7 @@ def main():
     elif args.command == "contract":
         apic.handle_contract_command(args.contract, args.tenant)
     elif args.command == "subnet":
-        apic.handle_subnet_command(args.tenant, args.prefix)
+        apic.handle_subnet_command(args.tenant, args.prefix, args.cidr)
 
 if __name__ == "__main__":
     main()

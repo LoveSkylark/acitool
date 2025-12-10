@@ -19,19 +19,33 @@ There are two ways to install and use the ACI Tool:
 
 The easiest way to deploy this tool is using the provided container script. This will build a Docker/Podman container that handles all dependencies and creates an alias for easy command execution from the host.
 
-```bash
-git clone https://github.com/LoveSkylark/acitool.git
-cd acitool
-./deploy_container.sh
-```
-or:
+#### Quick Start
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/LoveSkylark/acitool/refs/heads/main/deploy_container.sh | sudo bash
-```
+1. **Configure your environment first:**
+   ```bash
+   git clone https://github.com/LoveSkylark/acitool.git
+   cd acitool
+   cp .env.example .env
+   ```
+
+2. **Edit the `.env` file with your APIC details:**
+   ```bash
+   # Required: Set your APIC URL
+   APIC_URL=https://your-apic-url.com
+
+   # Optional: Set credentials (if not set, you'll be prompted)
+   APIC_USERNAME=admin
+   APIC_PASSWORD=your-password
+   ```
+
+3. **Run the deployment script:**
+   ```bash
+   ./deploy_container.sh
+   ```
 
 **What this does:**
-- Builds a Docker/Podman container with all required dependencies
+- Reads configuration from `.env` file
+- Builds a Docker/Podman container with all required dependencies and your APIC URL
 - Creates an alias `acitool` that executes commands from the host directly into the container
 - Isolates the tool environment from your system Python installation
 - No manual dependency management required
@@ -68,15 +82,27 @@ python3 acitool.py <command> [args]
 
 ### Environment Variables
 
-Create a `.env` file in the project root for automatic authentication:
+The `.env` file in the project root is used for configuration and authentication.
+
+**For Container Deployment:**
+- **REQUIRED**: You must configure the `.env` file **before** running `deploy_container.sh`
+- Copy `.env.example` to `.env` and set at minimum the `APIC_URL`
+- The deployment script reads this file during container build
+
+**For Manual Python Environment:**
+- Create a `.env` file in the `acitool/scripts` directory
+- Configuration is loaded at runtime
 
 ```bash
+# Required
 APIC_URL=https://your-apic-url.com
-*APIC_USERNAME=your-username #(Optional, not recomeneded)
-*APIC_PASSWORD=your-password #(Optional, not recomeneded)
+
+# Optional (not recommended for security)
+APIC_USERNAME=your-username
+APIC_PASSWORD=your-password
 ```
 
-*If environment variables are not set, the script will prompt for credentials interactively.
+*If credentials are not set in `.env`, the script will prompt for them interactively.
 
 ### Token Caching
 
@@ -109,7 +135,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 | `port --id X --port Y`                     | Show all bindings on a physical port (EPG + L3Out).          |
 | `vpc --nodes A-B [--interface vpc-name]`   | Show VPC interfaces or their bindings.                       |
 | `vlan <vlan-id>`                           | Show all EPG/L3Out/CEp bindings and VLAN pool membership.    |
-| `subnet [--tenant T] [--prefix X]`         | List all subnets in the fabric.                              |
+| `subnet [CIDR] [--tenant T] [--prefix X]`  | List all subnets in the fabric, optionally filtered by CIDR. |
 
 
 ---
@@ -285,15 +311,29 @@ Shows:
 
 ```bash
 acitool subnet
-acitool subnet --tenant TenantA
+acitool subnet 10.1.0.0/16
+acitool subnet 192.168.0.0/16 --tenant TenantA
 acitool subnet --prefix /30
+acitool subnet 10.0.0.0/8 --prefix /24
 ```
 
 Shows all subnets in the fabric, including:
 - Bridge Domain subnets (fvSubnet)
 - L3Out external subnets (l3extSubnet)
 
-Filters can be applied by tenant or prefix pattern.
+### Filtering Options:
+
+- **CIDR Range** (positional): Filter subnets within a specific IP range
+  - Example: `acitool subnet 10.1.0.0/16` shows only subnets within 10.1.0.0/16
+  - Automatically handles IPv4/IPv6 version matching (IPv6 subnets are skipped when filtering by IPv4, and vice versa)
+
+- **--tenant**: Filter by tenant name
+  - Example: `acitool subnet --tenant Production`
+
+- **--prefix**: Filter by subnet mask length
+  - Example: `acitool subnet --prefix /24` shows only /24 subnets
+
+Filters can be combined to narrow results further.
 
 ---
 
@@ -378,6 +418,18 @@ acitool vpc 201-202
 
 ```bash
 acitool subnet --tenant external
+```
+
+## Find all subnets within a specific CIDR range
+
+```bash
+acitool subnet 192.168.0.0/16
+```
+
+## Find all /24 subnets within the 10.0.0.0/8 range
+
+```bash
+acitool subnet 10.0.0.0/8 --prefix /24
 ```
 
 ---

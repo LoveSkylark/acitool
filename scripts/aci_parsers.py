@@ -7,6 +7,10 @@ Cisco ACI Distinguished Names (DNs) into structured components.
 
 import re
 from typing import Dict, Any, Optional
+from aci_models import (
+    EPGBinding, L3OutBinding, PathInfo, VRFInfo,
+    BridgeDomainInfo, SubnetInfo, EndpointInfo
+)
 
 
 # -------------------------------------------------------
@@ -95,3 +99,174 @@ def format_epg_label(dn: str) -> str:
     if last.startswith(("rsprov-", "rscons-")):
         return last.split("-", 1)[-1]
     return last
+
+
+# -------------------------------------------------------
+# Dataclass Factory Functions
+# -------------------------------------------------------
+
+def parse_epg_binding(dn: str, encap: str) -> Optional[EPGBinding]:
+    """
+    Parse EPG binding from DN and encap.
+
+    Args:
+        dn: Distinguished Name (e.g., uni/tn-T/ap-A/epg-E/...)
+        encap: Encapsulation (e.g., vlan-100)
+
+    Returns:
+        EPGBinding instance or None if parse fails
+    """
+    match = parse_regex(RE_EPG, dn)
+    if match:
+        return EPGBinding(
+            tenant=match["tenant"],
+            app_profile=match["ap"],
+            epg=match["epg"],
+            encap=encap
+        )
+    return None
+
+
+def parse_l3out_binding(dn: str, encap: str) -> Optional[L3OutBinding]:
+    """
+    Parse L3Out binding from DN and encap.
+
+    Args:
+        dn: Distinguished Name (e.g., uni/tn-T/out-O/lnodep-.../lifp-I)
+        encap: Encapsulation (e.g., vlan-100)
+
+    Returns:
+        L3OutBinding instance or None if parse fails
+    """
+    match = parse_regex(RE_L3OUT_PATH, dn)
+    if match:
+        return L3OutBinding(
+            tenant=match["tenant"],
+            l3out=match["out"],
+            interface=match["lifp"],
+            encap=encap
+        )
+    return None
+
+
+def parse_path_info(tdn: str) -> Optional[PathInfo]:
+    """
+    Parse physical path from topology DN.
+
+    Args:
+        tdn: Topology DN (e.g., topology/pod-1/paths-201/pathep-[eth1/1])
+
+    Returns:
+        PathInfo instance or None if parse fails
+    """
+    match = parse_regex(RE_PATH_TDN, tdn)
+    if match:
+        return PathInfo(
+            pod=match["pod"],
+            node=match["node"],
+            interface=match["iface"]
+        )
+    return None
+
+
+def parse_vrf_info(dn: str) -> Optional[VRFInfo]:
+    """
+    Parse VRF from DN.
+
+    Args:
+        dn: Distinguished Name (e.g., uni/tn-T/ctx-V)
+
+    Returns:
+        VRFInfo instance or None if parse fails
+    """
+    match = parse_regex(RE_VRF, dn)
+    if match:
+        return VRFInfo(
+            tenant=match["tenant"],
+            vrf=match["vrf"]
+        )
+    return None
+
+
+def parse_bd_info(dn: str) -> Optional[BridgeDomainInfo]:
+    """
+    Parse Bridge Domain from DN.
+
+    Args:
+        dn: Distinguished Name (e.g., uni/tn-T/BD-B)
+
+    Returns:
+        BridgeDomainInfo instance or None if parse fails
+    """
+    match = parse_regex(RE_BD, dn)
+    if match:
+        return BridgeDomainInfo(
+            tenant=match["tenant"],
+            bd=match["bd"]
+        )
+    return None
+
+
+def parse_subnet_info(dn: str, cidr: str, parent_type: str) -> Optional[SubnetInfo]:
+    """
+    Parse subnet info from DN and CIDR.
+
+    Args:
+        dn: Distinguished Name
+        cidr: CIDR notation (e.g., 10.0.0.0/24)
+        parent_type: "BD" or "L3Out"
+
+    Returns:
+        SubnetInfo instance or None if parse fails
+    """
+    tenant = extract_tenant_from_dn(dn)
+
+    if parent_type == "BD":
+        match = parse_regex(RE_BD, dn)
+        if match:
+            return SubnetInfo(
+                tenant=tenant,
+                cidr=cidr,
+                parent=match["bd"],
+                parent_type="BD"
+            )
+    elif parent_type == "L3Out":
+        match = parse_regex(RE_L3OUT, dn)
+        if match:
+            return SubnetInfo(
+                tenant=tenant,
+                cidr=cidr,
+                parent=match["l3out"],
+                parent_type="L3Out"
+            )
+
+    return None
+
+
+def parse_endpoint_info(dn: str, ip: Optional[str] = None, mac: Optional[str] = None,
+                       encap: Optional[str] = None, fabric_path: Optional[str] = None) -> Optional[EndpointInfo]:
+    """
+    Parse endpoint information from DN and attributes.
+
+    Args:
+        dn: Distinguished Name (e.g., uni/tn-T/ap-A/epg-E/cep-MAC)
+        ip: IP address
+        mac: MAC address
+        encap: Encapsulation
+        fabric_path: Fabric path DN
+
+    Returns:
+        EndpointInfo instance or None if parse fails
+    """
+    match = parse_regex(RE_CEP, dn)
+    if match:
+        return EndpointInfo(
+            tenant=match["tenant"],
+            app_profile=match["ap"],
+            epg=match["epg"],
+            ip=ip,
+            mac=mac or match.get("cep"),
+            encap=encap,
+            fabric_path=fabric_path
+        )
+    return None
