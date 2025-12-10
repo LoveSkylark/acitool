@@ -33,8 +33,5 @@ RUN mkdir -p /home/aciuser/.aci && \
 # Switch to non-root user
 USER aciuser
 
-# Set the entrypoint
-ENTRYPOINT ["python3", "/app/acitool.py"]
-
 # Default command
 CMD ["tail", "-f", "/dev/null"]
