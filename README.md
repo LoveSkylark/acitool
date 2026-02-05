@@ -145,7 +145,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 Run:
 
 ```bash
-acitool clean <vrf|bd|epg|empty|aaep|vlan>
+acitool clean <vrf|bd|epg|empty|aaep|vlan|contract>
 ```
 
 ---
@@ -203,6 +203,44 @@ Finds **AAEPs not mapped to any interface or domain**.
 ## `clean vlan`
 
 Finds **VLAN pools that are not referenced by any domain or AAEP**.
+
+---
+
+## `clean contract`
+
+Finds **contracts with missing or incomplete assignments**. This command identifies three categories of potentially problematic contracts:
+
+1. **Contracts with NO provider AND NO consumer** - Completely unused contracts that can likely be removed
+2. **Contracts with ONLY provider (no consumer)** - Services are being provided but nobody is consuming them
+3. **Contracts with ONLY consumer (no provider)** - EPGs are trying to consume a service but nobody is providing it
+
+The command checks both EPG-level and vzAny-level provider/consumer relationships, and correctly handles contracts in the "common" tenant that are consumed/provided by EPGs in other tenants.
+
+Output example:
+
+```
+================================================================================
+Contracts with NO provider AND NO consumer:
+================================================================================
+
+tenant1:
+  - unused-contract-1
+  - unused-contract-2
+
+================================================================================
+Contracts with ONLY provider (no consumer):
+================================================================================
+
+tenant2:
+  - orphaned-provider
+
+================================================================================
+Contracts with ONLY consumer (no provider):
+================================================================================
+
+tenant3:
+  - missing-provider
+```
 
 ---
 

@@ -74,6 +74,7 @@ def parse_args():
     clean_sub.add_parser("bd",  help="List BDs with no EPG or L3Out attached")
     clean_sub.add_parser("epg", help="List EPGs without contracts, members, or static bindings")
     clean_sub.add_parser("empty", help="List EPGs with no MAC, IP addresses, or static bindings")
+    clean_sub.add_parser("contract", help="List contracts with no provider/consumer or only one side assigned")
     clean_sub.add_parser("subnet", help="List all subnets in the fabric")
 
     contract_parser = subparsers.add_parser("contract", help="Contract lookup")
@@ -84,6 +85,10 @@ def parse_args():
     subnet_parser.add_argument("cidr", nargs="?", default=None, help="Optional CIDR to filter subnets within (e.g., 10.1.0.0/16)")
     subnet_parser.add_argument("-t", "--tenant", help="Filter by tenant name", default=None)
     subnet_parser.add_argument("-p", "--prefix", help="Filter by subnet mask (e.g., /24, /30)", default=None)
+
+    aaep_parser = subparsers.add_parser("aaep", help="List Attachable Access Entity Profiles or show connection map")
+    aaep_parser.add_argument("name", nargs="?", default=None, help="Optional AAEP name to show connection map")
+    aaep_parser.add_argument("-l", "--list-endpoints", nargs="?", const=True, default=False, help="List all MAC/IP addresses connected to the AAEP, optionally filter by EPG path (e.g., Tenant/App/EPG)")
 
     return parser.parse_args()
 
@@ -819,6 +824,7 @@ class ACIClient:
             "empty": self.handle_clean_empty,
             "aaep": self.handle_clean_aaep,
             "vlan": self.handle_clean_vlan,
+            "contract": self.handle_clean_contract,
             "subnet": lambda: self.list_all_subnets(),
         }
 
@@ -827,6 +833,134 @@ class ACIClient:
             handler()
         else:
             print(f"Unknown clean command: {clean_cmd}")
+
+    def handle_clean_contract(self):
+        """List contracts with no provider/consumer or only one side assigned."""
+        print("Checking contracts with missing or incomplete assignments...\n")
+
+        # Get all contracts, providers, and consumers (including vzAny)
+        contracts = self.cached_api("/api/node/class/vzBrCP.json")
+        providers = self.cached_api("/api/node/class/fvRsProv.json")
+        consumers = self.cached_api("/api/node/class/fvRsCons.json")
+        vzany_providers = self.cached_api("/api/node/class/vzRsAnyToProv.json")
+        vzany_consumers = self.cached_api("/api/node/class/vzRsAnyToCons.json")
+
+        # Build a map of contract usage: tenant/contract -> {has_provider, has_consumer}
+        contract_map = {}
+
+        # First, collect all contracts
+        for item in contracts:
+            attr = item["vzBrCP"]["attributes"]
+            contract_name = attr["name"]
+            dn = attr["dn"]
+            # DN format: uni/tn-TENANT/brc-CONTRACT
+            if "/tn-" in dn and "/brc-" in dn:
+                tenant = dn.split("/tn-")[1].split("/")[0]
+                key = f"{tenant}/{contract_name}"
+                contract_map[key] = {"has_provider": False, "has_consumer": False, "tenant": tenant, "contract": contract_name}
+
+        # Mark contracts that have providers (EPG-level)
+        for item in providers:
+            attr = item["fvRsProv"]["attributes"]
+            tDn = attr.get("tDn", "")
+            # tDn format: uni/tn-TENANT/brc-CONTRACT
+            if tDn and "/tn-" in tDn and "/brc-" in tDn:
+                tenant = tDn.split("/tn-")[1].split("/")[0]
+                contract_name = tDn.split("/brc-")[1].split("/")[0]
+                key = f"{tenant}/{contract_name}"
+                if key in contract_map:
+                    contract_map[key]["has_provider"] = True
+
+        # Mark contracts that have consumers (EPG-level)
+        for item in consumers:
+            attr = item["fvRsCons"]["attributes"]
+            tDn = attr.get("tDn", "")
+            # tDn format: uni/tn-TENANT/brc-CONTRACT
+            if tDn and "/tn-" in tDn and "/brc-" in tDn:
+                tenant = tDn.split("/tn-")[1].split("/")[0]
+                contract_name = tDn.split("/brc-")[1].split("/")[0]
+                key = f"{tenant}/{contract_name}"
+                if key in contract_map:
+                    contract_map[key]["has_consumer"] = True
+
+        # Mark contracts that have providers (vzAny-level)
+        for item in vzany_providers:
+            attr = item["vzRsAnyToProv"]["attributes"]
+            tDn = attr.get("tDn", "")
+            # tDn format: uni/tn-TENANT/brc-CONTRACT
+            if tDn and "/tn-" in tDn and "/brc-" in tDn:
+                tenant = tDn.split("/tn-")[1].split("/")[0]
+                contract_name = tDn.split("/brc-")[1].split("/")[0]
+                key = f"{tenant}/{contract_name}"
+                if key in contract_map:
+                    contract_map[key]["has_provider"] = True
+
+        # Mark contracts that have consumers (vzAny-level)
+        for item in vzany_consumers:
+            attr = item["vzRsAnyToCons"]["attributes"]
+            tDn = attr.get("tDn", "")
+            # tDn format: uni/tn-TENANT/brc-CONTRACT
+            if tDn and "/tn-" in tDn and "/brc-" in tDn:
+                tenant = tDn.split("/tn-")[1].split("/")[0]
+                contract_name = tDn.split("/brc-")[1].split("/")[0]
+                key = f"{tenant}/{contract_name}"
+                if key in contract_map:
+                    contract_map[key]["has_consumer"] = True
+
+        # Categorize contracts
+        no_assignment = {}  # No provider AND no consumer
+        only_provider = {}  # Has provider but no consumer
+        only_consumer = {}  # Has consumer but no provider
+
+        for key, info in contract_map.items():
+            tenant = info["tenant"]
+            contract = info["contract"]
+
+            if not info["has_provider"] and not info["has_consumer"]:
+                no_assignment.setdefault(tenant, []).append(contract)
+            elif info["has_provider"] and not info["has_consumer"]:
+                only_provider.setdefault(tenant, []).append(contract)
+            elif not info["has_provider"] and info["has_consumer"]:
+                only_consumer.setdefault(tenant, []).append(contract)
+
+        # Display results
+        found_issues = False
+
+        if no_assignment:
+            found_issues = True
+            print("=" * 80)
+            print("Contracts with NO provider AND NO consumer:")
+            print("=" * 80)
+            for tenant in sorted(no_assignment.keys()):
+                print(f"\n{tenant}:")
+                for contract in sorted(no_assignment[tenant]):
+                    print(f"  - {contract}")
+            print()
+
+        if only_provider:
+            found_issues = True
+            print("=" * 80)
+            print("Contracts with ONLY provider (no consumer):")
+            print("=" * 80)
+            for tenant in sorted(only_provider.keys()):
+                print(f"\n{tenant}:")
+                for contract in sorted(only_provider[tenant]):
+                    print(f"  - {contract}")
+            print()
+
+        if only_consumer:
+            found_issues = True
+            print("=" * 80)
+            print("Contracts with ONLY consumer (no provider):")
+            print("=" * 80)
+            for tenant in sorted(only_consumer.keys()):
+                print(f"\n{tenant}:")
+                for contract in sorted(only_consumer[tenant]):
+                    print(f"  - {contract}")
+            print()
+
+        if not found_issues:
+            print("All contracts have both provider and consumer assigned.")
 
     def handle_contract_command(self, contract_name: str, tenant_filter: Optional[str] = None):
         """Find and display contract providers, consumers, and exports."""
@@ -1368,6 +1502,574 @@ class ACIClient:
         """List all subnets in the ACI fabric."""
         self.list_all_subnets(tenant_filter, prefix_filter, cidr_filter)
 
+    def handle_aaep_command(self, aaep_name: Optional[str] = None, list_endpoints = False):
+        """
+        List all Attachable Access Entity Profiles (AAEPs) or show connection map for a specific AAEP.
+
+        Args:
+            aaep_name: If provided, show detailed connection map for this AAEP
+            list_endpoints: If True or string, list MAC/IP addresses. If string, filter by EPG path
+        """
+        if aaep_name:
+            self.handle_aaep_detail_command(aaep_name, list_endpoints)
+        else:
+            self.handle_aaep_list_command()
+
+    def handle_aaep_list_command(self):
+        """List all Attachable Access Entity Profiles."""
+        print("Listing all Attachable Access Entity Profiles (AAEPs):\n")
+
+        aaeps = self.cached_api("/api/node/class/infraAttEntityP.json")
+
+        if not aaeps:
+            print("No AAEPs found.")
+            return
+
+        # Sort AAEPs by name
+        aaep_list = sorted([item["infraAttEntityP"]["attributes"]["name"] for item in aaeps])
+
+        tree = {"AAEPs": aaep_list}
+        self.print_tree(tree)
+
+        print(f"\nTotal: {len(aaep_list)} AAEP(s)")
+        print("\nTip: Use 'acitool aaep <name>' to see the connection map for a specific AAEP")
+
+    def handle_aaep_detail_command(self, aaep_name: str, list_endpoints = False):
+        """
+        Show connection map for a specific AAEP, including:
+        - Domains associated with the AAEP
+        - VLAN pools used by those domains
+        - Interface policies/profiles that reference the AAEP
+        - Physical interfaces where the AAEP is applied
+        - Optionally, all MAC/IP addresses connected via this AAEP
+
+        Args:
+            aaep_name: Name of the AAEP to inspect
+            list_endpoints: If True or string, list MAC/IP addresses. If string, filter by EPG path
+        """
+        print(f"Connection map for AAEP: {aaep_name}\n")
+
+        # Get AAEP details
+        aaeps = self.cached_api("/api/node/class/infraAttEntityP.json")
+        aaep_obj = None
+        aaep_dn = None
+
+        for item in aaeps:
+            attr = item["infraAttEntityP"]["attributes"]
+            if attr["name"] == aaep_name:
+                aaep_obj = attr
+                aaep_dn = attr["dn"]
+                break
+
+        if not aaep_obj:
+            print(f"❌ AAEP '{aaep_name}' not found.")
+            return
+
+        tree = {}
+
+        # 1. Find domains associated with this AAEP
+        domain_refs = self.cached_api("/api/node/class/infraRsDomP.json")
+        domains = []
+
+        for item in domain_refs:
+            attr = item["infraRsDomP"]["attributes"]
+            if aaep_dn in attr.get("dn", ""):
+                tDn = attr.get("tDn", "")
+                # Parse domain DN to get type and name
+                # Possible domain types: physDomP (Physical), vmmDomP (VMM), l2extDomP (L2 External), l3extDomP (L3 External), fcDomP (FC)
+                if "/phys-" in tDn:
+                    domain_name = tDn.split("/phys-")[1].split("/")[0]
+                    domains.append(("Physical", domain_name, tDn))
+                elif "/vmmp-" in tDn:
+                    # VMM domains have format: uni/vmmp-VMware/dom-DVS_NAME
+                    parts = tDn.split("/")
+                    vendor = parts[1].replace("vmmp-", "") if len(parts) > 1 else "VMM"
+                    domain_name = parts[2].replace("dom-", "") if len(parts) > 2 else "unknown"
+                    domains.append((f"VMM ({vendor})", domain_name, tDn))
+                elif "/l2dom-" in tDn:
+                    domain_name = tDn.split("/l2dom-")[1].split("/")[0]
+                    domains.append(("L2 External", domain_name, tDn))
+                elif "/l3dom-" in tDn:
+                    domain_name = tDn.split("/l3dom-")[1].split("/")[0]
+                    domains.append(("L3 External", domain_name, tDn))
+                elif "/fcdom-" in tDn:
+                    domain_name = tDn.split("/fcdom-")[1].split("/")[0]
+                    domains.append(("Fibre Channel", domain_name, tDn))
+
+        # Build domains section
+        if domains:
+            domain_tree = {}
+            for domain_type, domain_name, domain_dn in domains:
+                # Get VLAN pool for this domain
+                vlan_pool_refs = self.cached_api("/api/node/class/infraRsVlanNs.json")
+                vlan_pools = []
+
+                for vp_item in vlan_pool_refs:
+                    vp_attr = vp_item["infraRsVlanNs"]["attributes"]
+                    if domain_dn in vp_attr.get("dn", ""):
+                        vp_tDn = vp_attr.get("tDn", "")
+                        vp_match = RE_VLAN_POOL_TDN.search(vp_tDn)
+                        if vp_match:
+                            vlan_pools.append(vp_match.group("pool"))
+
+                if vlan_pools:
+                    domain_tree[f"{domain_type}: {domain_name}"] = {"VLAN Pools": vlan_pools}
+                else:
+                    domain_tree[f"{domain_type}: {domain_name}"] = ["No VLAN pool"]
+
+            tree["Domains"] = domain_tree
+
+        # 2. Find interface policy groups that reference this AAEP
+        aaep_refs = self.cached_api("/api/node/class/infraRsAttEntP.json")
+        policy_groups = []
+
+        for item in aaep_refs:
+            attr = item["infraRsAttEntP"]["attributes"]
+            tDn = attr.get("tDn", "")
+
+            if f"attentp-{aaep_name}" in tDn:
+                dn = attr.get("dn", "")
+                # Parse interface policy group DN
+                # Format: uni/infra/funcprof/accportgrp-NAME or uni/infra/funcprof/accbundle-NAME
+                if "/accportgrp-" in dn:
+                    pg_name = dn.split("/accportgrp-")[1].split("/")[0]
+                    policy_groups.append(("Access Port", pg_name))
+                elif "/accbundle-" in dn:
+                    pg_name = dn.split("/accbundle-")[1].split("/")[0]
+                    policy_groups.append(("Port Channel/VPC", pg_name))
+
+        if policy_groups:
+            pg_tree = {}
+            for pg_type, pg_name in policy_groups:
+                pg_tree.setdefault(pg_type, []).append(pg_name)
+            tree["Interface Policy Groups"] = pg_tree
+
+        # 3. Find physical interfaces using this AAEP (via interface policy groups)
+        interface_tree = {}
+
+        # Get all interface selectors
+        if policy_groups:
+            # Get interface profile relationships
+            rs_acc_base_grp = self.cached_api("/api/node/class/infraRsAccBaseGrp.json")
+
+            for pg_type, pg_name in policy_groups:
+                # Find which interface selectors use this policy group
+                for item in rs_acc_base_grp:
+                    attr = item["infraRsAccBaseGrp"]["attributes"]
+                    tDn = attr.get("tDn", "")
+
+                    if f"-{pg_name}" in tDn:
+                        dn = attr.get("dn", "")
+                        # Parse: uni/infra/accportprof-PROFILE/hports-SELECTOR-typ-range
+                        # OR: uni/infra/fexprof-PROFILE/hports-SELECTOR-typ-range (for FEX)
+                        if "/accportprof-" in dn or "/fexprof-" in dn:
+                            parts = dn.split("/")
+                            profile_name = None
+                            selector_name = None
+
+                            for part in parts:
+                                if part.startswith("accportprof-"):
+                                    profile_name = part.replace("accportprof-", "")
+                                elif part.startswith("fexprof-"):
+                                    profile_name = part.replace("fexprof-", "")
+                                elif part.startswith("hports-"):
+                                    selector_name = part.replace("hports-", "").replace("-typ-range", "")
+
+                            if profile_name and selector_name:
+                                # Get port blocks for this selector
+                                port_blocks = self.get_api(
+                                    f"/api/mo/{dn}.json?query-target=children&target-subtree-class=infraPortBlk"
+                                )
+
+                                ports = []
+                                for pb in port_blocks or []:
+                                    pb_attr = pb["infraPortBlk"]["attributes"]
+                                    from_port = pb_attr.get("fromPort")
+                                    to_port = pb_attr.get("toPort")
+
+                                    if from_port == to_port:
+                                        ports.append(f"Port {from_port}")
+                                    else:
+                                        ports.append(f"Ports {from_port}-{to_port}")
+
+                                # Find which switch profiles use this interface profile
+                                rs_acc_port_p = self.cached_api("/api/node/class/infraRsAccPortP.json")
+
+                                for sw_item in rs_acc_port_p:
+                                    sw_attr = sw_item["infraRsAccPortP"]["attributes"]
+                                    if f"accportprof-{profile_name}" in sw_attr.get("tDn", ""):
+                                        sw_dn = sw_attr.get("dn", "")
+                                        # Parse switch profile: uni/infra/nprof-SWITCH_PROFILE
+                                        if "/nprof-" in sw_dn:
+                                            sw_profile = sw_dn.split("/nprof-")[1].split("/")[0]
+
+                                            # Get node selectors for this switch profile
+                                            node_sels = self.get_api(
+                                                f"/api/mo/uni/infra/nprof-{sw_profile}.json?query-target=children&target-subtree-class=infraNodeBlk"
+                                            )
+
+                                            nodes = []
+                                            for ns in node_sels or []:
+                                                ns_attr = ns["infraNodeBlk"]["attributes"]
+                                                from_node = ns_attr.get("from_")
+                                                to_node = ns_attr.get("to_")
+
+                                                if from_node == to_node:
+                                                    nodes.append(from_node)
+                                                else:
+                                                    nodes.append(f"{from_node}-{to_node}")
+
+                                            if nodes and ports:
+                                                for node in nodes:
+                                                    node_label = self.normalize_node_label("1", node)
+                                                    interface_tree.setdefault(node_label, []).extend([
+                                                        f"{selector_name}: {port}" for port in ports
+                                                    ])
+
+        if interface_tree:
+            tree["Physical Interfaces"] = interface_tree
+
+        # Print the tree
+        if tree:
+            self.print_tree(tree, label=f"AAEP '{aaep_name}' Connection Map")
+        else:
+            print(f"⚠️  AAEP '{aaep_name}' exists but has no associations.")
+
+        # 4. List endpoints (MAC/IP addresses) if requested
+        if list_endpoints:
+            print("\n" + "=" * 80)
+            print("Endpoints (MAC/IP Addresses) connected via this AAEP:")
+            print("=" * 80 + "\n")
+
+            endpoint_tree = {}
+            epg_dns = set()  # Use set to avoid duplicates
+
+            # Strategy: Find EPGs that use domains from this AAEP AND have static/dynamic bindings
+            # to this AAEP's interfaces
+
+            # Step 1: Find all EPGs that use domains associated with this AAEP
+            domain_dns = [dn for _, _, dn in domains]
+            epg_candidates = set()  # EPGs that use our domains
+
+            if domain_dns:
+                epg_domains = self.cached_api("/api/node/class/fvRsDomAtt.json")
+
+                for item in epg_domains:
+                    attr = item["fvRsDomAtt"]["attributes"]
+                    tDn = attr.get("tDn", "")
+
+                    # Check if this EPG uses one of our domains
+                    if any(domain_dn in tDn for domain_dn in domain_dns):
+                        dn = attr.get("dn", "")
+                        # Extract EPG DN (remove the domain relation part)
+                        # dn format: uni/tn-X/ap-Y/epg-Z/rsdomAtt-[...]
+                        if "/rsdomAtt-" in dn:
+                            epg_dn = dn.split("/rsdomAtt-")[0]
+                        else:
+                            epg_dn = "/".join(dn.split("/")[:5])  # Get up to epg-Z
+                        epg_candidates.add(epg_dn)
+
+            # Step 2: Build a set of actual topology paths for this AAEP's interfaces
+            topology_paths = set()
+
+            # Get all interface selectors that reference this AAEP's policy groups
+            rs_acc_base_grp = self.cached_api("/api/node/class/infraRsAccBaseGrp.json")
+
+            for pg_type, pg_name in policy_groups:
+                for item in rs_acc_base_grp:
+                    attr = item["infraRsAccBaseGrp"]["attributes"]
+                    tDn = attr.get("tDn", "")
+
+                    if f"-{pg_name}" in tDn:
+                        dn = attr.get("dn", "")
+                        # Parse: uni/infra/accportprof-PROFILE/hports-SELECTOR-typ-range/rsaccBaseGrp
+                        # OR: uni/infra/fexprof-PROFILE/hports-SELECTOR-typ-range/rsaccBaseGrp (for FEX)
+                        # We need to query the parent (hports) not the child (rsaccBaseGrp)
+                        if "/accportprof-" in dn or "/fexprof-" in dn:
+                            # Remove the /rsaccBaseGrp part to get the hports DN
+                            hports_dn = dn.rsplit("/", 1)[0] if "/rsaccBaseGrp" in dn else dn
+
+                            # Get port blocks for this selector
+                            port_blocks = self.get_api(
+                                f"/api/mo/{hports_dn}.json?query-target=children&target-subtree-class=infraPortBlk"
+                            )
+
+                            port_numbers = []
+                            for pb in port_blocks or []:
+                                pb_attr = pb["infraPortBlk"]["attributes"]
+                                from_port = pb_attr.get("fromPort")
+                                to_port = pb_attr.get("toPort")
+
+                                # Collect individual port numbers
+                                if from_port and to_port:
+                                    try:
+                                        from_num = int(from_port)
+                                        to_num = int(to_port)
+                                        port_numbers.extend(range(from_num, to_num + 1))
+                                    except ValueError:
+                                        # Handle non-numeric port identifiers
+                                        pass
+
+                            # Find which switch profiles use this interface profile
+                            parts = dn.split("/")
+                            profile_name = None
+                            is_fex = False
+                            for part in parts:
+                                if part.startswith("accportprof-"):
+                                    profile_name = part.replace("accportprof-", "")
+                                    break
+                                elif part.startswith("fexprof-"):
+                                    profile_name = part.replace("fexprof-", "")
+                                    is_fex = True
+                                    break
+
+                            if profile_name:
+                                if is_fex:
+                                    # For FEX profiles, we need to find which leaf nodes the FEX is connected to
+                                    # The FEX path format is: topology/pod-1/paths-LEAF_ID/extpaths-FEX_ID/pathep-[eth1/PORT]
+
+                                    import re
+                                    fex_match = re.search(r'fex(\d+)', profile_name.lower())
+
+                                    if fex_match:
+                                        fex_id = fex_match.group(1)
+
+                                        # Query existing static path bindings to find which leaf node(s) this FEX is connected to
+                                        # This is more reliable than querying fabric topology
+                                        all_paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
+
+                                        leaf_ids = set()
+                                        for path_item in all_paths:
+                                            path_attr = path_item.get("fvRsPathAtt", {}).get("attributes", {})
+                                            tDn = path_attr.get("tDn", "")
+                                            # Look for paths like: topology/pod-1/paths-LEAF/extpaths-FEX_ID/...
+                                            if f"/extpaths-{fex_id}/" in tDn:
+                                                leaf_match = re.search(r'/paths-(\d+)/', tDn)
+                                                if leaf_match:
+                                                    leaf_ids.add(leaf_match.group(1))
+
+                                        if leaf_ids:
+                                            # Build FEX topology paths for each leaf
+                                            for leaf_id in leaf_ids:
+                                                for port_num in port_numbers:
+                                                    path = f"topology/pod-1/paths-{leaf_id}/extpaths-{fex_id}/pathep-[eth1/{port_num}]"
+                                                    topology_paths.add(path)
+                                else:
+                                    # Regular access port profile
+                                    rs_acc_port_p = self.cached_api("/api/node/class/infraRsAccPortP.json")
+
+                                    for sw_item in rs_acc_port_p:
+                                        sw_attr = sw_item["infraRsAccPortP"]["attributes"]
+                                        if f"accportprof-{profile_name}" in sw_attr.get("tDn", ""):
+                                            sw_dn = sw_attr.get("dn", "")
+                                            # Parse switch profile: uni/infra/nprof-SWITCH_PROFILE
+                                            if "/nprof-" in sw_dn:
+                                                sw_profile = sw_dn.split("/nprof-")[1].split("/")[0]
+
+                                                # Get node selectors for this switch profile
+                                                node_sels = self.get_api(
+                                                    f"/api/mo/uni/infra/nprof-{sw_profile}.json?query-target=children&target-subtree-class=infraNodeBlk"
+                                                )
+
+                                                node_ids = []
+                                                for ns in node_sels or []:
+                                                    ns_attr = ns["infraNodeBlk"]["attributes"]
+                                                    from_node = ns_attr.get("from_")
+                                                    to_node = ns_attr.get("to_")
+
+                                                    if from_node and to_node:
+                                                        try:
+                                                            from_num = int(from_node)
+                                                            to_num = int(to_node)
+                                                            node_ids.extend(range(from_num, to_num + 1))
+                                                        except ValueError:
+                                                            pass
+
+                                                # Build topology paths for each node/port combination
+                                                # Check if this is a Port Channel/VPC (bundle) or regular access port
+                                                if pg_type == "Port Channel/VPC":
+                                                    # For bundles, the path uses the policy group name, not individual ports
+                                                    # VPC format: topology/pod-1/protpaths-NODE1-NODE2/pathep-[PC_NAME]
+                                                    # PC format: topology/pod-1/paths-NODE/pathep-[PC_NAME]
+                                                    if len(node_ids) > 1:
+                                                        # VPC - multiple nodes
+                                                        sorted_nodes = sorted(node_ids)
+                                                        path = f"topology/pod-1/protpaths-{sorted_nodes[0]}-{sorted_nodes[1]}/pathep-[{pg_name}]"
+                                                        topology_paths.add(path)
+                                                    else:
+                                                        # Port Channel - single node
+                                                        for node_id in node_ids:
+                                                            path = f"topology/pod-1/paths-{node_id}/pathep-[{pg_name}]"
+                                                            topology_paths.add(path)
+                                                else:
+                                                    # Regular access port
+                                                    # Format: topology/pod-1/paths-NODE/pathep-[eth1/PORT]
+                                                    for node_id in node_ids:
+                                                        for port_num in port_numbers:
+                                                            # Handle both regular ports and breakout ports
+                                                            path = f"topology/pod-1/paths-{node_id}/pathep-[eth1/{port_num}]"
+                                                            topology_paths.add(path)
+
+            # Step 3: Filter EPG candidates to only those with static bindings to our paths
+            if epg_candidates and topology_paths:
+                all_static_paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
+
+                for path_item in all_static_paths:
+                    path_attr = path_item.get("fvRsPathAtt", {}).get("attributes", {})
+                    tDn = path_attr.get("tDn", "")
+                    dn = path_attr.get("dn", "")
+
+                    # Extract EPG DN from the path binding
+                    if "/rspathAtt-" in dn:
+                        epg_dn = dn.split("/rspathAtt-")[0]
+
+                        # Only add this EPG if:
+                        # 1. It's in our candidate list (uses our domains)
+                        # 2. This static binding references one of our topology paths
+                        if epg_dn in epg_candidates and any(topo_path in tDn for topo_path in topology_paths):
+                            epg_dns.add(epg_dn)
+
+            if not epg_dns:
+                if epg_candidates:
+                    print(f"Found {len(epg_candidates)} EPG(s) using the domains, but none have static bindings to this AAEP's interfaces.\n")
+                    print("This could mean:")
+                    print("  - The EPGs use the domains but are not statically bound to these specific interfaces")
+                    print("  - The interfaces may be used for dynamic bindings (VMM domains) instead")
+                    print("  - The EPGs may be bound to different interfaces using the same domain\n")
+                else:
+                    print("No EPGs found using this AAEP.\n")
+                    print("This could mean:")
+                    print("  - No EPGs are attached to the domains associated with this AAEP")
+                    print("  - The AAEP is configured but not actively in use\n")
+                return
+
+            # Get all endpoints (MAC/IP) in bulk
+            all_endpoints = self.cached_api("/api/node/class/fvCEp.json")
+            all_ips = self.cached_api("/api/node/class/fvIp.json")
+
+            # Build a map of endpoint DN to IPs for faster lookup
+            ip_map = {}
+            for ip_item in all_ips:
+                ip_attr = ip_item.get("fvIp", {}).get("attributes", {})
+                ip_dn = ip_attr.get("dn", "")
+                ip_addr = ip_attr.get("addr")
+
+                # Extract CEP DN from IP DN
+                # Format: uni/tn-X/ap-Y/epg-Z/cep-MAC/ip-[ADDR]
+                if "/cep-" in ip_dn and "/ip-" in ip_dn:
+                    cep_dn = ip_dn.split("/ip-")[0]
+                    if cep_dn not in ip_map:
+                        ip_map[cep_dn] = []
+                    if ip_addr:
+                        ip_map[cep_dn].append(ip_addr)
+
+            # Process endpoints
+            for item in all_endpoints:
+                attr = item.get("fvCEp", {}).get("attributes", {})
+                dn = attr.get("dn", "")
+                mac = attr.get("mac", "")
+                encap = attr.get("encap", "")
+
+                # Check if this endpoint belongs to one of our EPGs
+                for epg_dn in epg_dns:
+                    if epg_dn in dn:
+                        # Parse EPG info
+                        epg_match = parse_regex(RE_EPG, dn)
+                        if epg_match:
+                            tenant = epg_match["tenant"]
+                            ap = epg_match["ap"]
+                            epg = epg_match["epg"]
+
+                            # Get IP addresses for this MAC from our pre-built map
+                            ips = ip_map.get(dn, [])
+
+                            # Build the tree entry
+                            epg_path = f"{tenant}/{ap}/{epg}"
+                            if ips:
+                                for ip in ips:
+                                    endpoint_tree.setdefault(epg_path, []).append(f"MAC: {mac} | IP: {ip} | VLAN: {encap}")
+                            else:
+                                endpoint_tree.setdefault(epg_path, []).append(f"MAC: {mac} | VLAN: {encap}")
+                        break
+
+            if endpoint_tree:
+                # Determine if we're filtering by EPG
+                epg_filter = None
+                if isinstance(list_endpoints, str):
+                    epg_filter = list_endpoints
+
+                # If no EPG filter specified, just show the summary list
+                if not epg_filter:
+                    total_endpoints = 0
+                    for epg_path in sorted(endpoint_tree.keys()):
+                        count = len(endpoint_tree[epg_path])
+                        total_endpoints += count
+                        print(f"  {epg_path:<50} ({count})")
+
+                    print(f"\n{'=' * 80}")
+                    print(f"Total: {total_endpoints} endpoint(s) across {len(endpoint_tree)} EPG(s)")
+                    print(f"{'=' * 80}")
+                    return
+
+                # EPG filter is specified - show detailed table for that EPG
+                if epg_filter not in endpoint_tree:
+                    print(f"❌ EPG '{epg_filter}' not found or has no endpoints on this AAEP.\n")
+                    print("Available EPGs on this AAEP:")
+                    for epg in sorted(endpoint_tree.keys()):
+                        count = len(endpoint_tree[epg])
+                        print(f"  {epg:<50} ({count})")
+                    return
+
+                endpoints = endpoint_tree[epg_filter]
+
+                # Determine if we have IPs or not (to adjust column widths)
+                has_ip = any('IP:' in ep for ep in endpoints)
+
+                if has_ip:
+                    # Header with IP column
+                    print(f"\n┌{'─' * 54}┐")
+                    print(f"│ {epg_filter:<52} │")
+                    print(f"├{'─' * 54}┤")
+                    print(f"│ {'MAC Address':<19} │ {'IP Address':<15} │ {'VLAN':<12} │")
+                    print(f"├{'─' * 21}┼{'─' * 17}┼{'─' * 14}┤")
+
+                    for endpoint in sorted(endpoints):
+                        # Parse: "MAC: xx:xx:xx:xx:xx:xx | IP: x.x.x.x | VLAN: vlan-xxx"
+                        parts = endpoint.split(' | ')
+                        mac = parts[0].replace('MAC: ', '').strip()
+                        ip = parts[1].replace('IP: ', '').strip() if len(parts) > 2 else 'N/A'
+                        vlan = parts[2].replace('VLAN: ', '').strip() if len(parts) > 2 else parts[1].replace('VLAN: ', '').strip()
+
+                        print(f"│ {mac:<19} │ {ip:<15} │ {vlan:<12} │")
+                    print(f"└{'─' * 54}┘")
+
+                else:
+                    # Header without IP column (simpler format)
+                    print(f"\n┌{'─' * 36}┐")
+                    print(f"│ {epg_filter:<34} │")
+                    print(f"├{'─' * 36}┤")
+                    print(f"│ {'MAC Address':<19} │ {'VLAN':<12} │")
+                    print(f"├{'─' * 21}┼{'─' * 14}┤")
+
+                    for endpoint in sorted(endpoints):
+                        # Parse: "MAC: xx:xx:xx:xx:xx:xx | VLAN: vlan-xxx"
+                        parts = endpoint.split(' | ')
+                        mac = parts[0].replace('MAC: ', '').strip()
+                        vlan = parts[1].replace('VLAN: ', '').strip()
+
+                        print(f"│ {mac:<19} │ {vlan:<12} │")
+
+                    print(f"└{'─' * 36}┘")
+
+                # Footer
+                print(f"  Endpoints: {len(endpoints)}")
+                print(f"\n{'=' * 80}")
+                print(f"Total: {len(endpoints)} endpoint(s) in EPG '{epg_filter}'")
+                print(f"{'=' * 80}")
+            else:
+                print("No active endpoints found on EPGs using this AAEP.")
+                print("The EPGs are configured but have no learned MAC/IP addresses yet.\n")
+
     @staticmethod
     def print_tree(tree, label=None):
         """Print tree structure (backward compatibility wrapper)."""
@@ -1414,6 +2116,8 @@ def main():
         apic.handle_contract_command(args.contract, args.tenant)
     elif args.command == "subnet":
         apic.handle_subnet_command(args.tenant, args.prefix, args.cidr)
+    elif args.command == "aaep":
+        apic.handle_aaep_command(args.name, args.list_endpoints)
 
 if __name__ == "__main__":
     main()
