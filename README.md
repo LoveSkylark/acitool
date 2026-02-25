@@ -136,6 +136,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 | `vpc --nodes A-B [--interface vpc-name]`   | Show VPC interfaces or their bindings.                       |
 | `vlan <vlan-id>`                           | Show all EPG/L3Out/CEp bindings and VLAN pool membership.    |
 | `subnet [CIDR] [--tenant T] [--prefix X]`  | List all subnets in the fabric, optionally filtered by CIDR. |
+| `route <tenant>:<vrf> [filter] [-p X] [-d]` | Show consolidated routing table for a VRF across all leaf nodes. |
 
 
 ---
@@ -244,10 +245,48 @@ tenant3:
 
 ---
 
+# ROUTE COMMAND
+
+```bash
+acitool route <tenant>:<vrf> [filter] [-p PREFIX] [-d]
+```
+
+Shows a **consolidated IPv4 routing table** for a VRF, aggregated across all leaf nodes. Routes that exist on multiple leaves are shown as a single entry with all leaf node IDs listed.
+
+Infrastructure routes (`direct`, `local`, `am`, `broadcast`, `urib_internal`) and routes via the ACI internal `overlay-1` transport are hidden by default.
+
+### Output example:
+
+```
+Routing table for VRF myTenant:myVRF
+
+Prefix                 Proto          Via              Leafs
+-----------------------------------------------------------------------
+0.0.0.0/0              ospf           10.10.10.1       201, 202
+10.1.0.0/24            ospf           10.10.10.1       201, 202
+10.2.0.0/24            static         10.20.0.1        201
+192.168.1.0/30         ospf           10.10.10.2       201, 202
+
+Total: 4 prefix(es) across 2 leaf(s): 201, 202
+```
+
+### Filtering Options:
+
+- **filter** (positional, optional): Filter routes by string prefix or CIDR containment
+  - String prefix: `acitool route myTenant:myVRF 10.1` shows routes starting with `10.1`
+  - CIDR subnet: `acitool route myTenant:myVRF 10.0.0.0/8` shows routes within that subnet
+
+- **-p / --prefix**: Filter by subnet mask length
+  - Example: `acitool route myTenant:myVRF -p /32` shows only host routes
+
+- **-d / --detail**: Include infrastructure routes (`direct`, `local`, `am`, `broadcast`, `urib_internal`, `overlay-1`)
+
+---
+
 # CONTRACT COMMAND
 
 ```bash
-acitool contract <contract-name> [--tenant TENANT]
+acitool contract <contract-name> [--tenant TENANT] [-f]
 ```
 
 ### Features:
@@ -257,7 +296,8 @@ acitool contract <contract-name> [--tenant TENANT]
 - Shows providers & consumers
 - Marks imported providers/consumers
 - If contract is **global**, shows exported tenants
-- If `tenant` is specified the command will show filter entries
+- If `--tenant` is specified the command will show filter entries
+- `-f` / `--filters`: Show only the filter entries (subjects and filter rules), skipping providers/consumers
 
 ---
 
@@ -444,6 +484,24 @@ acitool ip 10.1.1.1
 
 ```bash
 acitool contract web-contract --tenant production
+```
+
+## Show routing table for a VRF
+
+```bash
+acitool route myTenant:myVRF
+```
+
+## Show only /32 host routes in a VRF
+
+```bash
+acitool route myTenant:myVRF -p /32
+```
+
+## Find all routes within a specific subnet
+
+```bash
+acitool route myTenant:myVRF 10.0.0.0/8
 ```
 
 ## Find all VPC interfaces on node pair

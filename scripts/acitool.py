@@ -80,6 +80,7 @@ def parse_args():
     contract_parser = subparsers.add_parser("contract", help="Contract lookup")
     contract_parser.add_argument("contract", help="Contract name")
     contract_parser.add_argument("-t", "--tenant", help="Only search inside this tenant")
+    contract_parser.add_argument("-f", "--filters", action="store_true", default=False, help="Show only filter entries (requires --tenant)")
 
     subnet_parser = subparsers.add_parser("subnet", help="List all subnets in use in the ACI fabric")
     subnet_parser.add_argument("cidr", nargs="?", default=None, help="Optional CIDR to filter subnets within (e.g., 10.1.0.0/16)")
@@ -89,6 +90,12 @@ def parse_args():
     aaep_parser = subparsers.add_parser("aaep", help="List Attachable Access Entity Profiles or show connection map")
     aaep_parser.add_argument("name", nargs="?", default=None, help="Optional AAEP name to show connection map")
     aaep_parser.add_argument("-l", "--list-endpoints", nargs="?", const=True, default=False, help="List all MAC/IP addresses connected to the AAEP, optionally filter by EPG path (e.g., Tenant/App/EPG)")
+
+    route_parser = subparsers.add_parser("route", help="Show consolidated routing table for a VRF across all leaf nodes")
+    route_parser.add_argument("vrf", help="VRF to look up in <tenant>:<vrf> format (e.g., myTenant:myVRF)")
+    route_parser.add_argument("filter", nargs="?", default=None, help="Filter routes by prefix string (e.g., 172.16.0) or CIDR subnet containment (e.g., 10.0.0.0/8)")
+    route_parser.add_argument("-p", "--prefix", default=None, help="Filter by subnet mask length (e.g., /24, /32)")
+    route_parser.add_argument("-d", "--detail", action="store_true", default=False, help="Include direct, local, am and broadcast routes")
 
     return parser.parse_args()
 
@@ -962,8 +969,27 @@ class ACIClient:
         if not found_issues:
             print("All contracts have both provider and consumer assigned.")
 
-    def handle_contract_command(self, contract_name: str, tenant_filter: Optional[str] = None):
+    def handle_contract_command(self, contract_name: str, tenant_filter: Optional[str] = None, filters_only: bool = False):
         """Find and display contract providers, consumers, and exports."""
+        if filters_only:
+            if tenant_filter:
+                self.handle_filter_command(contract_name, tenant_filter)
+            else:
+                # Find all tenants that have a contract with this name
+                contracts = self.cached_api("/api/node/class/vzBrCP.json")
+                tenants = sorted(set(
+                    item["vzBrCP"]["attributes"]["dn"].split("/tn-")[1].split("/")[0]
+                    for item in contracts
+                    if item["vzBrCP"]["attributes"]["name"] == contract_name
+                    and "/tn-" in item["vzBrCP"]["attributes"]["dn"]
+                ))
+                if not tenants:
+                    print(f"Contract '{contract_name}' not found.")
+                    return
+                for tenant in tenants:
+                    self.handle_filter_command(contract_name, tenant)
+            return
+
         print(f"Looking up contract: {contract_name}\n")
 
         # Cached API queries
@@ -1081,6 +1107,167 @@ class ACIClient:
 
         if tenant_filter:
             self.handle_filter_command(contract_name, tenant_filter)
+
+    def _query_api_params(self, cls: str, filter_str: str):
+        """Query an ACI class with a filter using params dict for correct URL encoding."""
+        try:
+            params = {"page-size": "5"} if not filter_str else {"query-target-filter": filter_str}
+            response = self.session.get(
+                f"{self.apic_url}/api/node/class/{cls}.json",
+                params=params,
+                verify=self.verify_ssl
+            )
+            response.raise_for_status()
+            return response.json().get("imdata", [])
+        except requests.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            return None
+
+    def handle_route_command(self, vrf_path: str, detail: bool = False, route_filter: str = None, prefix_filter: str = None):
+        """Show consolidated IPv4 routing table for a VRF across all leaf nodes."""
+        if ":" not in vrf_path:
+            print("Error: Please specify VRF as <tenant>:<vrf> (e.g., myTenant:myVRF)")
+            return
+
+        tenant, vrf = vrf_path.split(":", 1)
+        vrf_dn = f"uni/tn-{tenant}/ctx-{vrf}"
+
+        # Verify VRF exists
+        vrfs = self.cached_api("/api/node/class/fvCtx.json")
+        if not any(item["fvCtx"]["attributes"]["dn"] == vrf_dn for item in vrfs):
+            print(f"VRF '{vrf}' not found in tenant '{tenant}'.")
+            return
+
+        # DN format: topology/pod-X/node-Y/sys/uribv4/dom-TENANT:VRF/db-rt/rt-[prefix]
+        dom_name = f"{tenant}:{vrf}"
+
+        routes = self._query_api_params("uribv4Route", f'wcard(uribv4Route.dn,"dom-{dom_name}")')
+        nexthops = self._query_api_params("uribv4Nexthop", f'wcard(uribv4Nexthop.dn,"dom-{dom_name}")')
+
+        if not routes:
+            print(f"No routes found for VRF {tenant}:{vrf}")
+            return
+
+        # Build nexthop map: route_dn -> list of (owner, addr, nh_vrf)
+        # Nexthop DN: .../rt-[prefix]/nh-[owner]-[addr/mask]-[intf]-[vrf]
+        nh_map = {}
+        for nh_item in nexthops or []:
+            nh_attr = nh_item.get("uribv4Nexthop", {}).get("attributes", {})
+            nh_dn = nh_attr.get("dn", "")
+            route_dn_match = re.search(r'^(.*)/nh-\[', nh_dn)
+            if not route_dn_match:
+                continue
+            route_dn = route_dn_match.group(1)
+            owner = nh_attr.get("owner", "")
+            addr  = nh_attr.get("addr", "").split("/")[0]  # strip /mask
+            # Extract nexthop VRF (last [...] segment of DN)
+            nh_vrf_match = re.search(r'\]-\[([^\]]+)\]$', nh_dn)
+            nh_vrf = nh_vrf_match.group(1) if nh_vrf_match else ""
+            nh_map.setdefault(route_dn, []).append((owner, addr, nh_vrf))
+
+        # Build unified routing table:
+        # prefix -> { (owner, addr) -> [(node_id, nh_vrf), ...] }
+        route_table = {}
+        for route_item in routes:
+            attr = route_item.get("uribv4Route", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+
+            node_match = re.search(r'/node-(\d+)/', dn)
+            if not node_match:
+                continue
+            node_id = node_match.group(1)
+
+            prefix = attr.get("prefix", "")
+            if not prefix:
+                continue
+
+            for owner, addr, nh_vrf in nh_map.get(dn, []):
+                key = (owner, addr)
+                entry = (node_id, nh_vrf)
+                route_table.setdefault(prefix, {}).setdefault(key, [])
+                if entry not in route_table[prefix][key]:
+                    route_table[prefix][key].append(entry)
+
+        if not route_table:
+            print(f"No routes found for VRF {tenant}:{vrf}")
+            return
+
+        # Sort prefixes by network address
+        def sort_prefix(p):
+            try:
+                return ip_network(p, strict=False)
+            except ValueError:
+                return ip_network("255.255.255.255/32")
+
+        sorted_prefixes = sorted(route_table.keys(), key=sort_prefix)
+
+        # Apply optional filter
+        if route_filter:
+            if "/" in route_filter:
+                try:
+                    filter_net = ip_network(route_filter, strict=False)
+                    sorted_prefixes = [
+                        p for p in sorted_prefixes
+                        if ip_network(p, strict=False).subnet_of(filter_net)
+                    ]
+                except ValueError:
+                    print(f"Invalid CIDR filter: {route_filter}")
+                    return
+            else:
+                sorted_prefixes = [p for p in sorted_prefixes if p.startswith(route_filter)]
+
+        if prefix_filter:
+            try:
+                target_len = int(prefix_filter.lstrip("/"))
+                sorted_prefixes = [
+                    p for p in sorted_prefixes
+                    if ip_network(p, strict=False).prefixlen == target_len
+                ]
+            except ValueError:
+                print(f"Invalid prefix filter: {prefix_filter}")
+                return
+
+        # Print routing table — no Interface column, interface shown as node(intf)
+        cp = 22   # prefix col
+        co = 14   # owner/proto col
+        cn = 16   # next-hop col
+        header = f"{'Prefix':<{cp}} {'Proto':<{co}} {'Via':<{cn}} Leafs"
+        print(f"Routing table for VRF {tenant}:{vrf}\n")
+        print(header)
+        print("-" * len(header))
+
+        excluded_protos = {"direct", "am", "broadcast", "local", "urib_internal"}
+
+        all_nodes = set()
+        printed = 0
+        for prefix in sorted_prefixes:
+            nh_groups = route_table[prefix]
+
+            # Filter out infrastructure protos and overlay-1 nexthops unless -d is set
+            visible = {
+                k: v for k, v in nh_groups.items()
+                if (detail or k[0] not in excluded_protos)
+                and (detail or not all(nh_vrf == "overlay-1" for _, nh_vrf in v))
+            }
+            if not visible:
+                continue
+
+            for node_id, _ in [e for entries in visible.values() for e in entries]:
+                all_nodes.add(node_id)
+
+            printed += 1
+            for i, ((owner, addr), node_intfs) in enumerate(sorted(visible.items())):
+                proto = owner.split("-")[0] if "-" in owner else owner
+                via = addr if addr and addr != "0.0.0.0" else "-"
+                leafs_str = ", ".join(
+                    nid for nid, _ in sorted(node_intfs, key=lambda x: int(x[0]))
+                )
+                if i == 0:
+                    print(f"{prefix:<{cp}} {proto:<{co}} {via:<{cn}} {leafs_str}")
+                else:
+                    print(f"{'':>{cp}} {proto:<{co}} {via:<{cn}} {leafs_str}")
+
+        print(f"\nTotal: {printed} prefix(es) across {len(all_nodes)} leaf(s): {', '.join(sorted(all_nodes, key=int))}")
 
     def handle_tenant_command(self, tenant_name: str):
         """List all static and SVI bindings for a tenant."""
@@ -2113,11 +2300,13 @@ def main():
     elif args.command == "clean":
         apic.handle_clean_command(args.clean_cmd)
     elif args.command == "contract":
-        apic.handle_contract_command(args.contract, args.tenant)
+        apic.handle_contract_command(args.contract, args.tenant, args.filters)
     elif args.command == "subnet":
         apic.handle_subnet_command(args.tenant, args.prefix, args.cidr)
     elif args.command == "aaep":
         apic.handle_aaep_command(args.name, args.list_endpoints)
+    elif args.command == "route":
+        apic.handle_route_command(args.vrf, args.detail, args.filter, args.prefix)
 
 if __name__ == "__main__":
     main()
