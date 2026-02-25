@@ -132,8 +132,8 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 | `contract <name> [--tenant <tenant>]`      | Show providers, consumers, scope and exports for a contract. |
 | `tenant <tenant>`                          | Show all static bindings and SVI bindings in that tenant.    |
 | `ip <address>`                             | Look up endpoint, OSPF/BGP peer, static route or subnet.     |
-| `port --id X --port Y`                     | Show all bindings on a physical port (EPG + L3Out).          |
-| `vpc --nodes A-B [--interface vpc-name]`   | Show VPC interfaces or their bindings.                       |
+| `port <x/y> [-i <node-id>] [-n <name>]`   | Show all bindings on a physical port (EPG + L3Out).          |
+| `vpc <nodeA>-<nodeB> [vpc-name]`           | Show VPC interfaces or their bindings.                       |
 | `vlan <vlan-id>`                           | Show all EPG/L3Out/CEp bindings and VLAN pool membership.    |
 | `subnet [CIDR] [--tenant T] [--prefix X]`  | List all subnets in the fabric, optionally filtered by CIDR. |
 | `route <tenant>:<vrf> [filter] [-p X] [-d]` | Show consolidated routing table for a VRF across all leaf nodes. |
@@ -339,33 +339,82 @@ Finds:
 # PORT LOOKUP
 
 ```bash
-acitool port --id <node> --port <x/y>
+acitool port <x/y> -i <node-id>
+acitool port <x/y> -n <node-name>
 ```
 
-Shows **all bindings on physical port ethX/Y**:
+Shows **all EPG and L3Out bindings on a physical access port**. The node can be identified by numeric ID (`-i`) or by hostname (`-n`).
 
-* EPG static path binds
-* L3Out SVI bindings
+Both commands show the same information — use whichever identifier is more convenient.
 
-Grouped by tenant and AP/L3Out.
+Output is grouped by **tenant → AP/L3Out → EPG/interface (VLAN encap)**.
+
+### Output example:
+
+```
+Bindings for eth1/1 on pod-1/node-201:
+
+myTenant
+├── EPG: myAppProfile
+│   └── myEPG (vlan-100)
+└── L3: myL3Out
+    └── myInterface (vlan-200)
+```
+
+### Examples:
+
+```bash
+acitool port 1/1 -i 201          # by node ID
+acitool port 1/1 -n leaf-201     # by node name
+```
 
 ---
 
 # VPC LOOKUP
 
-## List VPCs on node pair:
+`acitool vpc` does the same as `acitool port` but for **VPC (port-channel) interfaces** which span two leaf nodes.
 
 ```bash
-acitool vpc <nodeA>-<NodeB>
+acitool vpc <nodeA>-<nodeB>
+acitool vpc <nodeA>-<nodeB> <vpc-name>
 ```
 
-## Show bindings on a specific VPC:
+### List all VPCs on a node pair:
 
 ```bash
-acitool vpc 201-202 <vpc_name>
+acitool vpc 201-202
 ```
 
-Shows EPG and L3Out bindings.
+Prints all VPC interface names configured on that leaf pair:
+
+```
+VPCs on nodes 201-202:
+  vpc-server-01
+  vpc-server-02
+  vpc-firewall
+```
+
+Use this to discover VPC names before drilling into a specific one.
+
+### Show bindings on a specific VPC:
+
+```bash
+acitool vpc 201-202 myVPC
+```
+
+Shows all EPG static path bindings and L3Out SVI bindings on that VPC, grouped by **tenant → AP/L3Out → EPG/interface (VLAN encap)**.
+
+### Output example:
+
+```
+Bindings for VPC myVPC on 201-202:
+
+myTenant
+├── EPG: myAppProfile
+│   └── myEPG (vlan-100)
+└── L3: myL3Out
+    └── myInterface (vlan-200)
+```
 
 ---
 
@@ -465,7 +514,8 @@ acitool clean epg
 ## Check all bindings on a specific port
 
 ```bash
-acitool port 1/10 --id 201
+acitool port 1/1 -i 201
+acitool port 1/1 -n leaf1
 ```
 
 ## Find what VLAN pools contain VLAN 100
