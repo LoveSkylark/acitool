@@ -3,6 +3,7 @@
 import os
 import re
 import sys
+import datetime
 import logging
 import getpass
 import argparse
@@ -39,6 +40,13 @@ logging.basicConfig(
     stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
+
+# Add a file handler so errors are written to disk without appearing on the terminal
+_log_file = os.path.expanduser("~/.aci_tool.log")
+_file_handler = logging.FileHandler(_log_file)
+_file_handler.setLevel(logging.ERROR)
+_file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+logger.addHandler(_file_handler)
 
 # -------------------------------
 # Argument Parsing
@@ -203,26 +211,8 @@ class ACIClient:
         if not username or not password:
             username, password = self.prompt_credentials()
 
-        payload = {
-            "aaaUser": {"attributes": {"name": username, "pwd": password}}
-        }
-        try:
-            response = self.session.post(f"{self.apic_url}/api/aaaLogin.json", json=payload, verify=self.verify_ssl)
-            response.raise_for_status()
-
-            # Parse and validate response
-            json_data = response.json()
-            self.token = json_data["imdata"][0]["aaaLogin"]["attributes"]["token"]
-            self.session.cookies["APIC-cookie"] = self.token
-            self.save_token_to_file()
-        except requests.RequestException as e:
-            logger.error(f"Login failed: {e}")
-            logger.info("Please verify your credentials and try again.")
-            # If login fails, clear cached credentials and retry with prompt
-            username, password = self.prompt_credentials()
-            payload = {
-                "aaaUser": {"attributes": {"name": username, "pwd": password}}
-            }
+        for attempt in range(2):
+            payload = {"aaaUser": {"attributes": {"name": username, "pwd": password}}}
             try:
                 response = self.session.post(f"{self.apic_url}/api/aaaLogin.json", json=payload, verify=self.verify_ssl)
                 response.raise_for_status()
@@ -230,12 +220,28 @@ class ACIClient:
                 self.token = json_data["imdata"][0]["aaaLogin"]["attributes"]["token"]
                 self.session.cookies["APIC-cookie"] = self.token
                 self.save_token_to_file()
-            except requests.RequestException as retry_error:
-                logger.error(f"Login failed again: {retry_error}")
+                return
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 401:
+                    # Write directly to log file — bypass logger to avoid printing to terminal
+                    with open(_log_file, "a") as _lf:
+                        _lf.write(f"{datetime.datetime.now()} ERROR: Login attempt {attempt + 1} failed (401): {e}\n")
+                    if attempt == 0:
+                        username, password = self.prompt_credentials()
+                        continue
+                    print("Login failed: invalid credentials.")
+                    exit(1)
+                logger.error(f"Login failed: {e}")
+                print(f"Login failed: {e}")
                 exit(1)
-        except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Unexpected login response format: {e}")
-            exit(1)
+            except requests.RequestException as e:
+                logger.error(f"Login failed: {e}")
+                print(f"Login failed: {e}")
+                exit(1)
+            except (KeyError, IndexError, TypeError) as e:
+                logger.error(f"Unexpected login response format: {e}")
+                print(f"Unexpected login response format: {e}")
+                exit(1)
 
     def ip_in_cidr(self, ip, cidr):
         try:
