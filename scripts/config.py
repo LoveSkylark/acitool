@@ -35,6 +35,14 @@ RETRY_ALLOWED_METHODS = ["HEAD", "GET", "OPTIONS", "POST"]
 
 
 # -------------------------------------------------------
+# Routing
+# -------------------------------------------------------
+
+# Protocol names hidden by default in route output (shown with -d/--detail)
+ROUTE_EXCLUDED_PROTOS = {"direct", "am", "broadcast", "local", "urib_internal"}
+
+
+# -------------------------------------------------------
 # Cache Configuration
 # -------------------------------------------------------
 

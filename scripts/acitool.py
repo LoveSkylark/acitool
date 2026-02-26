@@ -17,12 +17,12 @@ from typing import Dict, List, Optional, Tuple, Set, Any
 
 # Import local modules
 from config import (
-    API_NODE_CLASS, API_CLASS, EXCLUDED_CIDRS,
+    API_NODE_CLASS, API_CLASS, EXCLUDED_CIDRS, ROUTE_EXCLUDED_PROTOS,
     RETRY_TOTAL, RETRY_BACKOFF_FACTOR, RETRY_STATUS_FORCELIST, RETRY_ALLOWED_METHODS,
     API_CACHE_SIZE, NODE_INVENTORY_CACHE_SIZE
 )
 from aci_parsers import (
-    RE_VRF, RE_BD, RE_EPG, RE_EPG_DN, RE_CEP,
+    RE_VRF, RE_BD, RE_EPG, RE_EPG_DN,
     RE_L3OUT, RE_L3OUT_DN, RE_L3OUT_PATH,
     RE_PATH_TDN, RE_AAEP_TDN, RE_VLAN_POOL_TDN,
     parse_regex, extract_tenant_from_dn, format_epg_label,
@@ -48,8 +48,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Script to look up IP, port, VLAN, or tenant bindings inside ACI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    ip_parser = subparsers.add_parser("ip", help="Search by IP address")
-    ip_parser.add_argument("ip", help="IP to search for")
+    ip_parser = subparsers.add_parser("ip", help="Search by IP address or prefix")
+    ip_parser.add_argument("ip", help="Full IP address (e.g., 10.5.1.1) or string prefix (e.g., 10.5.1)")
+    ip_parser.add_argument("-p", "--prefix", default=None, help="Filter results by subnet mask length (e.g., /24, /32)")
+    ip_parser.add_argument("-t", "--tenant", default=None, help="Limit search to a single tenant (e.g., myTenant)")
 
     port_parser = subparsers.add_parser("port", help="Search by physical port")
     port_parser.add_argument("port", help="Physical port (e.g., 1/1)")
@@ -83,7 +85,7 @@ def parse_args():
     contract_parser.add_argument("-f", "--filters", action="store_true", default=False, help="Show only filter entries (requires --tenant)")
 
     subnet_parser = subparsers.add_parser("subnet", help="List all subnets in use in the ACI fabric")
-    subnet_parser.add_argument("cidr", nargs="?", default=None, help="Optional CIDR to filter subnets within (e.g., 10.1.0.0/16)")
+    subnet_parser.add_argument("filter", nargs="?", default=None, help="Filter by IP prefix string (e.g., 10.5.1) or CIDR containment (e.g., 10.1.0.0/16)")
     subnet_parser.add_argument("-t", "--tenant", help="Filter by tenant name", default=None)
     subnet_parser.add_argument("-p", "--prefix", help="Filter by subnet mask (e.g., /24, /30)", default=None)
 
@@ -95,6 +97,9 @@ def parse_args():
     route_parser.add_argument("vrf", help="VRF to look up in <tenant>:<vrf> format (e.g., myTenant:myVRF)")
     route_parser.add_argument("filter", nargs="?", default=None, help="Filter routes by prefix string (e.g., 172.16.0) or CIDR subnet containment (e.g., 10.0.0.0/8)")
     route_parser.add_argument("-p", "--prefix", default=None, help="Filter by subnet mask length (e.g., /24, /32)")
+    route_scope = route_parser.add_mutually_exclusive_group()
+    route_scope.add_argument("-l", "--local", action="store_true", default=False, help="Show only routes native to this VRF (exclude imported/leaked routes)")
+    route_scope.add_argument("-x", "--external", action="store_true", default=False, help="Show only routes imported from other VRFs/tenants via contracts")
     route_parser.add_argument("-d", "--detail", action="store_true", default=False, help="Include direct, local, am and broadcast routes")
 
     return parser.parse_args()
@@ -127,8 +132,33 @@ class ACIClient:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     @lru_cache(maxsize=API_CACHE_SIZE)
-    def cached_api(self, endpoint: str):
-        return self.get_api(endpoint) or []
+    def query_api(self, endpoint: str, filter_str: str = "") -> list:
+        """Unified cached API query. Passes filter_str as query-target-filter via URL encoding."""
+        params = {"query-target-filter": filter_str} if filter_str else None
+        try:
+            response = self.session.get(
+                f"{self.apic_url}{endpoint}",
+                params=params,
+                verify=self.verify_ssl
+            )
+            response.raise_for_status()
+            return response.json().get("imdata", [])
+        except requests.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            return []
+
+    @lru_cache(maxsize=1)
+    def get_tep_pool(self):
+        """Return the fabric infrastructure TEP pool as an ip_network, or None."""
+        data = self.query_api("/api/node/mo/uni/infra/settings.json")
+        for item in data:
+            tep = item.get("infraSetPol", {}).get("attributes", {}).get("tepPool", "")
+            if tep:
+                try:
+                    return ip_network(tep, strict=False)
+                except ValueError:
+                    pass
+        return None
 
     def load_token_from_file(self):
         if os.path.exists(self.token_file):
@@ -207,17 +237,6 @@ class ACIClient:
             logger.error(f"Unexpected login response format: {e}")
             exit(1)
 
-    def get_api(self, api_path):
-        if not self.token:
-            raise Exception("Not logged in. Call login() first.")
-        try:
-            response = self.session.get(f"{self.apic_url}{api_path}", verify=self.verify_ssl)
-            response.raise_for_status()
-            return response.json().get("imdata", [])
-        except requests.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            return None
-
     def ip_in_cidr(self, ip, cidr):
         try:
             return ip_address(ip) in ip_network(cidr, strict=False)
@@ -236,78 +255,115 @@ class ACIClient:
         logger.warning(f"Could not find pod ID for node '{id_or_name}'")
         return None
 
-    def process_endpoint(self, data):
+    def process_endpoint(self, data, tenant_filter=None):
         found = False
         for item in data:
             attr = item.get("fvIp", {}).get("attributes", {})
             addr = attr.get("addr", "")
             dn = attr.get("dn", "")
-            tDn = attr.get("tDn", "")
             fabric_path = attr.get("fabricPathDn", "")
 
-            dn_match = parse_regex(RE_CEP, dn)
-            # For fabric_path we need a simpler pattern match
-            fp_match = re.search(r"pod-(?P<pod>\d+)/paths-(?P<node>\d+)/pathep-\[(?P<pathep>[^\]]+)\]", fabric_path)
+            endpoint = parse_endpoint_info(dn, ip=addr, fabric_path=fabric_path)
+            path = parse_path_info(fabric_path)
 
-            if dn_match and fp_match:
+            if endpoint and path:
+                if tenant_filter and endpoint.tenant != tenant_filter:
+                    continue
                 print(f"IP found in:")
-                print(f"  {dn_match['tenant']}\n    AP:{dn_match['ap']}\n      {dn_match['epg']}\n")
-                print(f"  Physical location: Pod-{fp_match['pod']}, Node-{fp_match['node']} MAC:[{dn_match['cep']}]")
-                print(f"  Interface Selector: {fp_match['pathep']}")
+                print(f"  {endpoint.tenant}\n    AP:{endpoint.app_profile}\n      {endpoint.epg}\n")
+                print(f"  Physical location: Pod-{path.pod}, Node-{path.node} MAC:[{endpoint.mac}]")
+                print(f"  Interface Selector: {path.interface}")
                 found = True
 
         return found
 
-    def process_subnet(self, data, ip):
+    def process_subnet(self, data, ip, prefix_mode=False, prefix_filter=None, tenant_filter=None):
         tree = {}
         for item in data:
             attr = item.get("fvSubnet", {}).get("attributes", {})
             cidr = attr.get("ip", "")
-            if not self.ip_in_cidr(ip, cidr):
+            if cidr in EXCLUDED_CIDRS:
                 continue
+            if prefix_mode:
+                if not cidr.startswith(ip):
+                    continue
+            elif not self.ip_in_cidr(ip, cidr):
+                continue
+            if prefix_filter:
+                try:
+                    if ip_network(cidr, strict=False).prefixlen != int(prefix_filter.lstrip("/")):
+                        continue
+                except ValueError:
+                    continue
 
             dn = attr.get("dn", "")
-            match = re.search(
-                r"uni/tn-(?P<tenant>[^/]+)/(?:BD-(?P<bd>[^/]+)/|ap-(?P<ap>[^/]+)/epg-(?P<epg>[^/]+)/)",
-                dn
-            )
 
-            if not match:
+            # BD subnet
+            info = parse_subnet_info(dn, cidr, "BD")
+            if info:
+                if tenant_filter and info.tenant != tenant_filter:
+                    continue
+                leaf_list = tree.setdefault(info.tenant, {}).setdefault("BD:", {}).setdefault("_leaf", [])
+                label = f"{info.parent} - {cidr}"
+                if label not in leaf_list:
+                    leaf_list.append(label)
                 continue
 
-            tenant, bd, ap, epg = match["tenant"], match["bd"], match["ap"], match["epg"]
-            tree.setdefault(tenant, {})
-            if bd:
-                tree[tenant].setdefault("BD:", []).append(f"{bd} - {cidr}")
-            if ap:
-                tree[tenant].setdefault("AP:", {}).setdefault(ap, []).append(f"{epg} - {cidr}")
+            # EPG subnet
+            match = parse_regex(RE_EPG, dn)
+            if match:
+                if tenant_filter and match["tenant"] != tenant_filter:
+                    continue
+                node = tree.setdefault(match["tenant"], {}).setdefault("AP:", {}).setdefault(match["ap"], {})
+                leaf_list = node.setdefault("_leaf", [])
+                label = f"{match['epg']} - {cidr}"
+                if label not in leaf_list:
+                    leaf_list.append(label)
 
         if tree:
             self.print_tree(tree, label="IP not found, possible Subnet:")
 
-    def process_external_subnet(self, data, ip):
+    def process_external_subnet(self, data, ip, prefix_mode=False, prefix_filter=None, tenant_filter=None):
         tree = {}
 
         for item in data:
             attr = item.get("l3extSubnet", {}).get("attributes", {})
             cidr = attr.get("ip", "")
-            if cidr in EXCLUDED_CIDRS or not self.ip_in_cidr(ip, cidr):
+            if cidr in EXCLUDED_CIDRS:
+                continue
+            if prefix_mode:
+                if not cidr.startswith(ip):
+                    continue
+            elif not self.ip_in_cidr(ip, cidr):
+                continue
+            if prefix_filter:
+                try:
+                    if ip_network(cidr, strict=False).prefixlen != int(prefix_filter.lstrip("/")):
+                        continue
+                except ValueError:
+                    continue
+
+            dn = attr.get("dn", "")
+            l3out_match = parse_regex(RE_L3OUT, dn)
+            if not l3out_match:
                 continue
 
-            match = re.search(
-                r"uni/tn-(?P<tenant>[^/]+)/out-(?P<out>[^/]+)/instP-(?P<network>[^/]+)/extsubnet-\[(?P<subnet>[^\]]+)\]",
-                attr.get("dn", "")
-            )
-            if not match:
+            if tenant_filter and l3out_match["tenant"] != tenant_filter:
                 continue
 
-            tenant, out, network, subnet_info = match.groups()
-            tree.setdefault(tenant, {}).setdefault("out:", {}).setdefault(out, []).append(f"{network} - {subnet_info}")
+            instp_match = re.search(r"/instP-([^/]+)/", dn)
+            network = instp_match.group(1) if instp_match else cidr
+
+            node = tree.setdefault(l3out_match["tenant"], {}).setdefault(f"L3Out: {l3out_match['l3out']}", {})
+            leaf_list = node.setdefault("_leaf", [])
+            label = f"{network} - {cidr}"
+            if label not in leaf_list:
+                leaf_list.append(label)
 
         if tree:
             self.print_tree(tree, label="Possible L3out:")
 
-    def process_peer(self, data, ip_to_lookup, kind):
+    def process_peer(self, data, ip_to_lookup, kind, tenant_filter=None):
         tree = {}
         for item in data:
             attr = item.get(kind, {}).get("attributes", {})
@@ -318,28 +374,35 @@ class ACIClient:
 
             dn = attr.get("dn", "")
             if kind == "l3extIp":
-                match = re.search(r"uni/tn-([^/]+)/out-([^/]+)/lnodep-([^/]+)/lifp-([^/]+)", dn)
+                match = parse_regex(RE_L3OUT_PATH, dn)
                 if match:
-                    tenant, l3out, _, iface = match.groups()
-                    label = f"/{iface} - {addr}"
-                    tree.setdefault(tenant, {}).setdefault(f"L3Out: {l3out}", set()).add(label)
+                    if tenant_filter and match["tenant"] != tenant_filter:
+                        continue
+                    node = tree.setdefault(match["tenant"], {}).setdefault(f"L3Out: {match['out']}", {})
+                    leaf_list = node.setdefault("_leaf", [])
+                    label = f"{match['lifp']} - {addr}"
+                    if label not in leaf_list:
+                        leaf_list.append(label)
 
             elif kind == "bgpPeer":
                 match = re.search(r"pod-([^/]+)/node-([^/]+)/.*?/dom-([^:/]+)", dn)
                 if match:
                     _, _, tenant = match.groups()
+                    if tenant_filter and tenant != tenant_filter:
+                        continue
+                    node = tree.setdefault(tenant, {}).setdefault("BGP Peers:", {})
+                    leaf_list = node.setdefault("_leaf", [])
                     label = f"Peer IP: {addr}"
-                    tree.setdefault(tenant, {}).setdefault(f"L3Out: {tenant}", set()).add(label)
+                    if label not in leaf_list:
+                        leaf_list.append(label)
 
         if tree:
-            tree = {t: {k: list(v) for k, v in cats.items()} for t, cats in tree.items()}
             label = f"Matching {'OSPF' if kind == 'l3extIp' else 'BGP'} Peers:"
             self.print_tree(tree, label=label)
             return True
-        else:
-            return False
+        return False
 
-    def process_static_route(self, data, ip_to_lookup):
+    def process_static_route(self, data, ip_to_lookup, tenant_filter=None):
         tree = {}
 
         for item in data:
@@ -351,15 +414,18 @@ class ACIClient:
             match = re.search(r"uni/tn-([^/]+)/out-([^/]+)/instP-([^/]+)", attr.get("dn", ""))
             if match:
                 tenant, l3out, instP = match.groups()
-                label = f"/{instP} - {prefix}"
-                tree.setdefault(tenant, {}).setdefault(f"L3Out: {l3out}", set()).add(label)
+                if tenant_filter and tenant != tenant_filter:
+                    continue
+                node = tree.setdefault(tenant, {}).setdefault(f"L3Out: {l3out}", {})
+                leaf_list = node.setdefault("_leaf", [])
+                label = f"{instP} - {prefix}"
+                if label not in leaf_list:
+                    leaf_list.append(label)
 
         if tree:
-            tree = {t: {k: list(v) for k, v in cats.items()} for t, cats in tree.items()}
             self.print_tree(tree, label="Matching Static Routes:")
             return True
-        else:
-            return False
+        return False
 
     def find_vlan_in_vlan_pools(self, pools, vlan_id) -> List[VLANPoolRange]:
         """
@@ -374,7 +440,7 @@ class ACIClient:
             pool_name = pool_attrs["name"]
 
             # Fetch all encap blocks for this pool
-            blocks = self.get_api(
+            blocks = self.query_api(
                 f"/api/mo/{pool_dn}.json?query-target=children&target-subtree-class=fvnsEncapBlk"
             )
 
@@ -483,37 +549,41 @@ class ACIClient:
             return last.split("-", 1)[-1]
         return last
 
-    def list_all_subnets(self, tenant_filter=None, prefix_filter=None, cidr_filter=None):
+    def list_all_subnets(self, tenant_filter=None, prefix_filter=None, ip_filter=None):
         """
-        List all subnets in use in the ACI fabric (BD + L3Out), optionally filter by tenant, subnet mask, or CIDR range.
+        List all subnets in use in the ACI fabric (BD + L3Out), optionally filter by tenant, subnet mask, or IP.
+        ip_filter: string prefix (e.g., "10.5.1") or CIDR containment (e.g., "10.1.0.0/16")
         """
         tree = {}
 
-        # Validate and parse CIDR filter if provided
+        # Parse ip_filter — string prefix match or CIDR containment
+        filter_prefix = None
         filter_network = None
-        if cidr_filter:
-            try:
-                filter_network = ip_network(cidr_filter, strict=False)
-            except ValueError as e:
-                print(f"Error: Invalid CIDR format '{cidr_filter}': {e}")
-                return
+        if ip_filter:
+            if "/" in ip_filter:
+                try:
+                    filter_network = ip_network(ip_filter, strict=False)
+                except ValueError as e:
+                    print(f"Error: Invalid CIDR format '{ip_filter}': {e}")
+                    return
+            else:
+                filter_prefix = ip_filter
 
-        def subnet_matches(ip_cidr, prefix_filter, cidr_filter_net):
-            """Check if subnet matches prefix and/or CIDR range filters."""
-            if not prefix_filter and not cidr_filter_net:
-                return True
+        def subnet_matches(ip_cidr):
+            """Check if subnet matches the active ip_filter and prefix_filter."""
             try:
                 net = ip_network(ip_cidr, strict=False)
 
-                # Check prefix filter
+                if filter_prefix and not ip_cidr.startswith(filter_prefix):
+                    return False
+
                 if prefix_filter and net.prefixlen != int(prefix_filter.lstrip("/")):
                     return False
 
-                # Check CIDR range filter (only if same IP version)
-                if cidr_filter_net:
-                    if net.version != cidr_filter_net.version:
-                        return False  # Skip mismatched IP versions
-                    if not net.subnet_of(cidr_filter_net):
+                if filter_network:
+                    if net.version != filter_network.version:
+                        return False
+                    if not net.subnet_of(filter_network):
                         return False
 
                 return True
@@ -523,13 +593,16 @@ class ACIClient:
         # -----------------------
         # 1. BD / SVI Subnets
         # -----------------------
-        bd_subnets = self.get_api("/api/class/fvSubnet.json?query-target=self")
+        bd_subnets = self.query_api("/api/node/class/fvSubnet.json")
         for item in bd_subnets:
             attr = item.get("fvSubnet", {}).get("attributes", {})
             dn = attr.get("dn", "")
             ip = attr.get("ip", "")
-            match = parse_regex(RE_BD, dn)
 
+            if ip in EXCLUDED_CIDRS:
+                continue
+
+            match = parse_regex(RE_BD, dn)
             if not match:
                 continue
 
@@ -539,7 +612,7 @@ class ACIClient:
             if tenant_filter and tenant != tenant_filter:
                 continue
 
-            if not subnet_matches(ip, prefix_filter, filter_network):
+            if not subnet_matches(ip):
                 continue
 
             tree.setdefault(tenant, {}).setdefault("BD Subnets:", []).append(f"{bd} - {ip}")
@@ -547,13 +620,16 @@ class ACIClient:
         # -----------------------
         # 2. L3Out Subnets
         # -----------------------
-        l3out_subnets = self.get_api("/api/class/l3extSubnet.json?query-target=self")
+        l3out_subnets = self.query_api("/api/node/class/l3extSubnet.json")
         for item in l3out_subnets:
             attr = item.get("l3extSubnet", {}).get("attributes", {})
             dn = attr.get("dn", "")
             ip = attr.get("ip", "")
-            match = parse_regex(RE_L3OUT, dn)
 
+            if ip in EXCLUDED_CIDRS:
+                continue
+
+            match = parse_regex(RE_L3OUT, dn)
             if not match:
                 continue
 
@@ -563,7 +639,7 @@ class ACIClient:
             if tenant_filter and tenant != tenant_filter:
                 continue
 
-            if not subnet_matches(ip, prefix_filter, filter_network):
+            if not subnet_matches(ip):
                 continue
 
             tree.setdefault(tenant, {}).setdefault("L3Out Subnets:", []).append(f"{l3out} - {ip}")
@@ -573,7 +649,9 @@ class ACIClient:
         # -----------------------
         if tree:
             filters = []
-            if cidr_filter:
+            if filter_prefix:
+                filters.append(f"starting with {filter_prefix}")
+            if filter_network:
                 filters.append(f"within {filter_network}")
             if prefix_filter:
                 filters.append(f"prefix {prefix_filter}")
@@ -589,7 +667,7 @@ class ACIClient:
         Returns a dict mapping node_id -> node_name.
         Cached for the entire runtime (lru_cache maxsize=1).
         """
-        nodes = self.get_api("/api/node/class/fabricNode.json") or []
+        nodes = self.query_api("/api/node/class/fabricNode.json")
         node_map = {}
 
         for item in nodes:
@@ -633,9 +711,9 @@ class ACIClient:
         """List VRFs with no BD or L3Out attached."""
         print("Checking VRFs not attached to any BD or L3Out...\n")
 
-        ctxs = self.cached_api("/api/node/class/fvCtx.json")
-        l3_refs = self.cached_api("/api/node/class/l3extRsEctx.json")
-        bd_refs = self.cached_api("/api/node/class/fvRsCtx.json")
+        ctxs = self.query_api("/api/node/class/fvCtx.json")
+        l3_refs = self.query_api("/api/node/class/l3extRsEctx.json")
+        bd_refs = self.query_api("/api/node/class/fvRsCtx.json")
 
         all_vrfs = {}
         for item in ctxs:
@@ -667,9 +745,9 @@ class ACIClient:
         """List BDs with no EPG or L3Out attached."""
         print("Checking Bridge Domains not attached to any EPG or L3Out...\n")
 
-        bds = self.cached_api("/api/node/class/fvBD.json")
-        epg_bd = self.cached_api("/api/node/class/fvRsBd.json")
-        l3_sub = self.cached_api("/api/node/class/l3extSubnet.json")
+        bds = self.query_api("/api/node/class/fvBD.json")
+        epg_bd = self.query_api("/api/node/class/fvRsBd.json")
+        l3_sub = self.query_api("/api/node/class/l3extSubnet.json")
 
         all_bds = {}
         used_bds = set()
@@ -707,12 +785,12 @@ class ACIClient:
         """List EPGs without contracts, members, or static bindings."""
         print("Checking EPGs without any contract, members, or static bindings...\n")
 
-        epgs = self.cached_api("/api/node/class/fvAEPg.json")
-        prov = self.cached_api("/api/node/class/fvRsProv.json")
-        cons = self.cached_api("/api/node/class/fvRsCons.json")
-        macs = self.cached_api("/api/node/class/fvMac.json")
-        ips = self.cached_api("/api/node/class/fvIp.json")
-        paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
+        epgs = self.query_api("/api/node/class/fvAEPg.json")
+        prov = self.query_api("/api/node/class/fvRsProv.json")
+        cons = self.query_api("/api/node/class/fvRsCons.json")
+        macs = self.query_api("/api/node/class/fvMac.json")
+        ips = self.query_api("/api/node/class/fvIp.json")
+        paths = self.query_api("/api/node/class/fvRsPathAtt.json")
 
         all_epgs = {}
         for item in epgs:
@@ -744,10 +822,10 @@ class ACIClient:
         """List EPGs with no MAC, IP addresses, or static bindings."""
         print("Checking EPGs with no MAC, IP addresses, or static bindings...\n")
 
-        epgs = self.cached_api("/api/node/class/fvAEPg.json")
-        macs = self.cached_api("/api/node/class/fvMac.json")
-        ips = self.cached_api("/api/node/class/fvIp.json")
-        paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
+        epgs = self.query_api("/api/node/class/fvAEPg.json")
+        macs = self.query_api("/api/node/class/fvMac.json")
+        ips = self.query_api("/api/node/class/fvIp.json")
+        paths = self.query_api("/api/node/class/fvRsPathAtt.json")
 
         all_epgs = {}
         for item in epgs:
@@ -779,8 +857,8 @@ class ACIClient:
         """List AAEPs not assigned anywhere."""
         print("Checking AAEPs not assigned anywhere...\n")
 
-        aaeps = self.cached_api("/api/node/class/infraAttEntityP.json")
-        aaep_ref = self.cached_api("/api/node/class/infraRsAttEntP.json")
+        aaeps = self.query_api("/api/node/class/infraAttEntityP.json")
+        aaep_ref = self.query_api("/api/node/class/infraRsAttEntP.json")
 
         all_aaeps = {item["infraAttEntityP"]["attributes"]["name"] for item in aaeps}
         used = set()
@@ -803,8 +881,8 @@ class ACIClient:
         """List VLAN Pools not used by any Domain or AAEP."""
         print("Checking VLAN Pools not used by any Domain or AAEP...\n")
 
-        pools = self.cached_api("/api/node/class/fvnsVlanInstP.json")
-        pool_ref = self.cached_api("/api/node/class/infraRsVlanNs.json")
+        pools = self.query_api("/api/node/class/fvnsVlanInstP.json")
+        pool_ref = self.query_api("/api/node/class/infraRsVlanNs.json")
 
         all_pools = {item["fvnsVlanInstP"]["attributes"]["name"] for item in pools}
 
@@ -846,11 +924,11 @@ class ACIClient:
         print("Checking contracts with missing or incomplete assignments...\n")
 
         # Get all contracts, providers, and consumers (including vzAny)
-        contracts = self.cached_api("/api/node/class/vzBrCP.json")
-        providers = self.cached_api("/api/node/class/fvRsProv.json")
-        consumers = self.cached_api("/api/node/class/fvRsCons.json")
-        vzany_providers = self.cached_api("/api/node/class/vzRsAnyToProv.json")
-        vzany_consumers = self.cached_api("/api/node/class/vzRsAnyToCons.json")
+        contracts = self.query_api("/api/node/class/vzBrCP.json")
+        providers = self.query_api("/api/node/class/fvRsProv.json")
+        consumers = self.query_api("/api/node/class/fvRsCons.json")
+        vzany_providers = self.query_api("/api/node/class/vzRsAnyToProv.json")
+        vzany_consumers = self.query_api("/api/node/class/vzRsAnyToCons.json")
 
         # Build a map of contract usage: tenant/contract -> {has_provider, has_consumer}
         contract_map = {}
@@ -976,7 +1054,7 @@ class ACIClient:
                 self.handle_filter_command(contract_name, tenant_filter)
             else:
                 # Find all tenants that have a contract with this name
-                contracts = self.cached_api("/api/node/class/vzBrCP.json")
+                contracts = self.query_api("/api/node/class/vzBrCP.json")
                 tenants = sorted(set(
                     item["vzBrCP"]["attributes"]["dn"].split("/tn-")[1].split("/")[0]
                     for item in contracts
@@ -993,9 +1071,9 @@ class ACIClient:
         print(f"Looking up contract: {contract_name}\n")
 
         # Cached API queries
-        contracts = self.cached_api("/api/node/class/vzBrCP.json")
-        prov_epgs = self.cached_api("/api/node/class/fvRsProv.json")
-        cons_epgs = self.cached_api("/api/node/class/fvRsCons.json")
+        contracts = self.query_api("/api/node/class/vzBrCP.json")
+        prov_epgs = self.query_api("/api/node/class/fvRsProv.json")
+        cons_epgs = self.query_api("/api/node/class/fvRsCons.json")
 
         # Find all tenants that own a contract with this name
         if tenant_filter:
@@ -1062,7 +1140,7 @@ class ACIClient:
             if scope == "global":
                 exported_tree = {"Exported to:": {}}
                 dn = list(contract_dn_map.keys())[0]
-                exported_contracts = self.cached_api(
+                exported_contracts = self.query_api(
                     f"/api/mo/{dn}.json?query-target=subtree&target-subtree-class=vzRtIf"
                 )
                 pattern = re.compile(r"uni/tn-(?P<tenant>[^/]+)/cif-(?P<cif>[^/]+)")
@@ -1108,22 +1186,7 @@ class ACIClient:
         if tenant_filter:
             self.handle_filter_command(contract_name, tenant_filter)
 
-    def _query_api_params(self, cls: str, filter_str: str):
-        """Query an ACI class with a filter using params dict for correct URL encoding."""
-        try:
-            params = {"page-size": "5"} if not filter_str else {"query-target-filter": filter_str}
-            response = self.session.get(
-                f"{self.apic_url}/api/node/class/{cls}.json",
-                params=params,
-                verify=self.verify_ssl
-            )
-            response.raise_for_status()
-            return response.json().get("imdata", [])
-        except requests.RequestException as e:
-            logger.error(f"API request failed: {e}")
-            return None
-
-    def handle_route_command(self, vrf_path: str, detail: bool = False, route_filter: str = None, prefix_filter: str = None):
+    def handle_route_command(self, vrf_path: str, detail: bool = False, route_filter: str = None, prefix_filter: str = None, local_only: bool = False, external_only: bool = False):
         """Show consolidated IPv4 routing table for a VRF across all leaf nodes."""
         if ":" not in vrf_path:
             print("Error: Please specify VRF as <tenant>:<vrf> (e.g., myTenant:myVRF)")
@@ -1133,7 +1196,7 @@ class ACIClient:
         vrf_dn = f"uni/tn-{tenant}/ctx-{vrf}"
 
         # Verify VRF exists
-        vrfs = self.cached_api("/api/node/class/fvCtx.json")
+        vrfs = self.query_api("/api/node/class/fvCtx.json")
         if not any(item["fvCtx"]["attributes"]["dn"] == vrf_dn for item in vrfs):
             print(f"VRF '{vrf}' not found in tenant '{tenant}'.")
             return
@@ -1141,8 +1204,8 @@ class ACIClient:
         # DN format: topology/pod-X/node-Y/sys/uribv4/dom-TENANT:VRF/db-rt/rt-[prefix]
         dom_name = f"{tenant}:{vrf}"
 
-        routes = self._query_api_params("uribv4Route", f'wcard(uribv4Route.dn,"dom-{dom_name}")')
-        nexthops = self._query_api_params("uribv4Nexthop", f'wcard(uribv4Nexthop.dn,"dom-{dom_name}")')
+        routes = self.query_api("/api/node/class/uribv4Route.json", f'wcard(uribv4Route.dn,"dom-{dom_name}")')
+        nexthops = self.query_api("/api/node/class/uribv4Nexthop.json", f'wcard(uribv4Nexthop.dn,"dom-{dom_name}")')
 
         if not routes:
             print(f"No routes found for VRF {tenant}:{vrf}")
@@ -1236,19 +1299,47 @@ class ACIClient:
         print(header)
         print("-" * len(header))
 
-        excluded_protos = {"direct", "am", "broadcast", "local", "urib_internal"}
+        tep_pool = self.get_tep_pool()
+
+        def _is_leaked(prefix, v):
+            """True if this is a legitimate leaked route (all nexthops via overlay-1, not in TEP pool)."""
+            if not all(nh_vrf == "overlay-1" for _, nh_vrf in v):
+                return False
+            if tep_pool is not None:
+                try:
+                    if ip_network(prefix, strict=False).subnet_of(tep_pool):
+                        return False  # TEP pool = infra, not a leaked route
+                except (ValueError, TypeError):
+                    pass
+            return True
+
+        def _is_infra_overlay(prefix, v):
+            """True if this is an ACI infrastructure overlay route (TEP pool or local_only mode)."""
+            if not all(nh_vrf == "overlay-1" for _, nh_vrf in v):
+                return False
+            if local_only:
+                return True
+            if tep_pool is None:
+                return False
+            try:
+                return ip_network(prefix, strict=False).subnet_of(tep_pool)
+            except (ValueError, TypeError):
+                return False
 
         all_nodes = set()
         printed = 0
         for prefix in sorted_prefixes:
             nh_groups = route_table[prefix]
 
-            # Filter out infrastructure protos and overlay-1 nexthops unless -d is set
-            visible = {
-                k: v for k, v in nh_groups.items()
-                if (detail or k[0] not in excluded_protos)
-                and (detail or not all(nh_vrf == "overlay-1" for _, nh_vrf in v))
-            }
+            if external_only:
+                # Show only leaked routes (overlay-1, not in TEP pool)
+                visible = {k: v for k, v in nh_groups.items() if _is_leaked(prefix, v)}
+            else:
+                visible = {
+                    k: v for k, v in nh_groups.items()
+                    if (detail or k[0] not in ROUTE_EXCLUDED_PROTOS)
+                    and (detail or not _is_infra_overlay(prefix, v))
+                }
             if not visible:
                 continue
 
@@ -1273,8 +1364,8 @@ class ACIClient:
         """List all static and SVI bindings for a tenant."""
         print(f"Looking for all bindings in tenant: {tenant_name}\n")
 
-        static_paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
-        svi_paths = self.cached_api("/api/node/class/l3extRsPathL3OutAtt.json")
+        static_paths = self.query_api("/api/node/class/fvRsPathAtt.json")
+        svi_paths = self.query_api("/api/node/class/l3extRsPathL3OutAtt.json")
 
         static_tree = {}
         svi_tree = {}
@@ -1343,35 +1434,125 @@ class ACIClient:
         else:
             print("\nNo SVI bindings found.")
 
-    def handle_ip_command(self, ip_to_lookup: str):
-        """Search for an IP address in the ACI fabric."""
-        print(f"Looking up IP: {ip_to_lookup}\n")
+    def search_routes_for_ip(self, ip_str: str, prefix_filter: str = None, tenant_filter: str = None):
+        """Search all VRF routing tables for prefixes that contain or match ip_str.
+        Accepts a full IP address (containment check) or a string prefix (startswith match).
+        Uses a single bulk query across all nodes/VRFs for performance.
+        """
+        try:
+            ip = ip_address(ip_str)
+            prefix_mode = False
+        except ValueError:
+            ip = None
+            prefix_mode = True
 
-        # Cached API calls
-        fv_ip_data = self.cached_api(f"/api/node/class/fvIp.json?query-target-filter=eq(fvIp.addr,\"{ip_to_lookup}\")")
-        l3ext_ip_data = self.cached_api("/api/node/class/l3extIp.json")
-        bgp_peer_data = self.cached_api("/api/node/class/bgpPeer.json")
-        static_routes = self.cached_api("/api/node/class/ipRouteP.json")
-        subnets = self.cached_api("/api/node/class/fvSubnet.json")
-        external_subnets = self.cached_api("/api/node/class/l3extSubnet.json")
+        target_prefixlen = None
+        if prefix_filter:
+            try:
+                target_prefixlen = int(prefix_filter.lstrip("/"))
+            except ValueError:
+                print(f"Invalid prefix filter: {prefix_filter}")
+                return
 
-        # Process different types of matches
-        endpoint_found = self.process_endpoint(fv_ip_data)
-        ospf_found = self.process_peer(l3ext_ip_data, ip_to_lookup, kind="l3extIp")
-        bgp_found = self.process_peer(bgp_peer_data, ip_to_lookup, kind="bgpPeer")
-        static_found = self.process_static_route(static_routes, ip_to_lookup)
+        # Single query — all routes across all VRFs and all nodes
+        all_routes = self.query_api("/api/node/class/uribv4Route.json", 'wcard(uribv4Route.dn,"db-rt")')
+        if not all_routes:
+            return
 
-        # If nothing found, check subnets
-        if not any([endpoint_found, ospf_found, bgp_found, static_found]):
-            self.process_subnet(subnets, ip_to_lookup)
-            self.process_external_subnet(external_subnets, ip_to_lookup)
+        seen = set()   # (tenant, vrf, prefix) — deduplicate across nodes
+        tree = {}
+
+        for route_item in all_routes:
+            attr = route_item.get("uribv4Route", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            prefix = attr.get("prefix", "")
+
+            if not prefix or prefix in EXCLUDED_CIDRS:
+                continue
+
+            # Extract tenant:vrf from DN
+            dom_match = re.search(r'/uribv4/dom-([^/]+)/', dn)
+            if not dom_match:
+                continue
+            dom = dom_match.group(1)   # e.g. "myTenant:myVRF"
+            if ":" not in dom:
+                continue
+            tenant, vrf = dom.split(":", 1)
+
+            if tenant_filter and tenant != tenant_filter:
+                continue
+
+            key = (tenant, vrf, prefix)
+            if key in seen:
+                continue
+
+            try:
+                net = ip_network(prefix, strict=False)
+                if target_prefixlen is not None and net.prefixlen != target_prefixlen:
+                    continue
+                if prefix_mode:
+                    matches = prefix.startswith(ip_str)
+                else:
+                    matches = ip in net
+            except ValueError:
+                continue
+
+            if matches:
+                seen.add(key)
+                node = tree.setdefault(tenant, {}).setdefault(f"VRF: {vrf}", {})
+                leaf_list = node.setdefault("_leaf", [])
+                if prefix not in leaf_list:
+                    leaf_list.append(prefix)
+
+        if tree:
+            self.print_tree(tree, label="Route lookup across all VRFs:")
+
+    def handle_ip_command(self, ip_to_lookup: str, prefix_filter: str = None, tenant_filter: str = None):
+        """Search for an IP address or string prefix in the ACI fabric."""
+        try:
+            ip_address(ip_to_lookup)
+            is_full_ip = True
+        except ValueError:
+            is_full_ip = False
+
+        if is_full_ip:
+            print(f"Looking up IP: {ip_to_lookup}\n")
+
+            fv_ip_data = self.query_api("/api/node/class/fvIp.json", f'eq(fvIp.addr,"{ip_to_lookup}")')
+            l3ext_ip_data = self.query_api("/api/node/class/l3extIp.json")
+            bgp_peer_data = self.query_api("/api/node/class/bgpPeer.json")
+            static_routes = self.query_api("/api/node/class/ipRouteP.json")
+            subnets = self.query_api("/api/node/class/fvSubnet.json")
+            external_subnets = self.query_api("/api/node/class/l3extSubnet.json")
+
+            endpoint_found = self.process_endpoint(fv_ip_data, tenant_filter=tenant_filter)
+            ospf_found = self.process_peer(l3ext_ip_data, ip_to_lookup, kind="l3extIp", tenant_filter=tenant_filter)
+            bgp_found = self.process_peer(bgp_peer_data, ip_to_lookup, kind="bgpPeer", tenant_filter=tenant_filter)
+            static_found = self.process_static_route(static_routes, ip_to_lookup, tenant_filter=tenant_filter)
+
+            if not any([endpoint_found, ospf_found, bgp_found, static_found]):
+                self.process_subnet(subnets, ip_to_lookup, prefix_filter=prefix_filter, tenant_filter=tenant_filter)
+                self.process_external_subnet(external_subnets, ip_to_lookup, prefix_filter=prefix_filter, tenant_filter=tenant_filter)
+        else:
+            print(f"Looking up IP prefix: {ip_to_lookup}\n")
+
+            fv_ip_data = self.query_api("/api/node/class/fvIp.json", f'wcard(fvIp.addr,"{ip_to_lookup}*")')
+            subnets = self.query_api("/api/node/class/fvSubnet.json")
+            external_subnets = self.query_api("/api/node/class/l3extSubnet.json")
+
+            self.process_endpoint(fv_ip_data, tenant_filter=tenant_filter)
+            self.process_subnet(subnets, ip_to_lookup, prefix_mode=True, prefix_filter=prefix_filter, tenant_filter=tenant_filter)
+            self.process_external_subnet(external_subnets, ip_to_lookup, prefix_mode=True, prefix_filter=prefix_filter, tenant_filter=tenant_filter)
+
+        # Always search routing tables across all VRFs
+        self.search_routes_for_ip(ip_to_lookup, prefix_filter, tenant_filter)
 
     def handle_port_command(self, port: str, node_id: Optional[str] = None, node_name: Optional[str] = None):
         """Search for bindings on a physical port."""
         port_str = f"eth{port}"
 
         # Resolve pod and node
-        top_data = self.cached_api("/api/node/class/topSystem.json")
+        top_data = self.query_api("/api/node/class/topSystem.json")
         result = self.get_pod_for_node(top_data, node_id, node_name)
         if not result:
             print(f"Error: Could not find pod for node {node_id} ({node_name})")
@@ -1379,8 +1560,8 @@ class ACIClient:
         pod_id, node_id = result
 
         # Fetch bindings
-        static_bindings = self.cached_api("/api/node/class/fvRsPathAtt.json")
-        svi_bindings = self.cached_api("/api/class/l3extRsPathL3OutAtt.json")
+        static_bindings = self.query_api("/api/node/class/fvRsPathAtt.json")
+        svi_bindings = self.query_api("/api/class/l3extRsPathL3OutAtt.json")
 
         tree = {}
         port_pattern = f"topology/pod-{pod_id}/paths-{node_id}/pathep-[{port_str}]"
@@ -1435,7 +1616,7 @@ class ACIClient:
             exit(1)
 
         # Find pod ID
-        top_data = self.cached_api("/api/node/class/topSystem.json")
+        top_data = self.query_api("/api/node/class/topSystem.json")
         pod_id = None
         for item in top_data:
             attr = item.get("topSystem", {}).get("attributes", {})
@@ -1449,7 +1630,7 @@ class ACIClient:
 
         # If no interface specified, list all VPCs
         if not interface:
-            all_bindings = self.cached_api("/api/node/class/fvRsPathAtt.json")
+            all_bindings = self.query_api("/api/node/class/fvRsPathAtt.json")
             vpc_list = set()
             vpc_prefix = f"topology/pod-{pod_id}/protpaths-{node1}-{node2}/pathep-["
 
@@ -1471,7 +1652,7 @@ class ACIClient:
         vpc_pattern = f"topology/pod-{pod_id}/protpaths-{node1}-{node2}/pathep-[{interface}]"
 
         # L2 (Static Path) Bindings
-        static_bindings = self.cached_api("/api/node/class/fvRsPathAtt.json")
+        static_bindings = self.query_api("/api/node/class/fvRsPathAtt.json")
         for item in static_bindings:
             attr = item.get("fvRsPathAtt", {}).get("attributes", {})
             tDn = attr.get("tDn", "")
@@ -1492,7 +1673,7 @@ class ACIClient:
                 )
 
         # L3 (SVI / L3Out) Bindings
-        svi_bindings = self.cached_api("/api/class/l3extRsPathL3OutAtt.json")
+        svi_bindings = self.query_api("/api/class/l3extRsPathL3OutAtt.json")
         for item in svi_bindings:
             attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
             tDn = attr.get("tDn", "")
@@ -1521,8 +1702,8 @@ class ACIClient:
         vlan_str = f"vlan-{vlan_id}"
 
         # EPG Bindings
-        epg_bindings = self.get_api(
-            f"/api/node/class/fvRsPathAtt.json?query-target-filter=eq(fvRsPathAtt.encap,\"{vlan_str}\")"
+        epg_bindings = self.query_api(
+            "/api/node/class/fvRsPathAtt.json", f'eq(fvRsPathAtt.encap,"{vlan_str}")'
         )
         for item in epg_bindings:
             attr = item.get("fvRsPathAtt", {}).get("attributes", {})
@@ -1540,8 +1721,8 @@ class ACIClient:
                 )
 
         # L3Out Bindings
-        l3out_paths = self.get_api(
-            f"/api/class/l3extRsPathL3OutAtt.json?query-target-filter=eq(l3extRsPathL3OutAtt.encap,\"{vlan_str}\")"
+        l3out_paths = self.query_api(
+            "/api/class/l3extRsPathL3OutAtt.json", f'eq(l3extRsPathL3OutAtt.encap,"{vlan_str}")'
         )
         for item in l3out_paths:
             attr = item.get("l3extRsPathL3OutAtt", {}).get("attributes", {})
@@ -1559,8 +1740,8 @@ class ACIClient:
                 )
 
         # Dynamic EPG Members
-        endpoints = self.get_api(
-            f"/api/class/fvCEp.json?query-target-filter=eq(fvCEp.encap,\"{vlan_str}\")"
+        endpoints = self.query_api(
+            "/api/class/fvCEp.json", f'eq(fvCEp.encap,"{vlan_str}")'
         )
         for item in endpoints:
             attr = item.get("fvCEp", {}).get("attributes", {})
@@ -1585,7 +1766,7 @@ class ACIClient:
             print(f"\nVLAN {vlan_id} not found in any EPG or L3Out bindings.")
 
         # VLAN Pool Information
-        vlaninstp = self.get_api("/api/class/fvnsVlanInstP.json")
+        vlaninstp = self.query_api("/api/class/fvnsVlanInstP.json")
         pools = self.find_vlan_in_vlan_pools(vlaninstp, vlan_id)
         if pools:
             print(f"\nVLAN {vlan_id} found in pools:")
@@ -1599,11 +1780,11 @@ class ACIClient:
         print("")
 
         # Cached API queries
-        contracts = self.cached_api("/api/node/class/vzBrCP.json")
-        rs_subj_filt = self.cached_api("/api/node/class/vzRsSubjFiltAtt.json")
-        filters = self.cached_api("/api/node/class/vzFilter.json")
-        filter_entries = self.cached_api("/api/node/class/vzEntry.json")
-        subjects = self.cached_api("/api/node/class/vzSubj.json")
+        contracts = self.query_api("/api/node/class/vzBrCP.json")
+        rs_subj_filt = self.query_api("/api/node/class/vzRsSubjFiltAtt.json")
+        filters = self.query_api("/api/node/class/vzFilter.json")
+        filter_entries = self.query_api("/api/node/class/vzEntry.json")
+        subjects = self.query_api("/api/node/class/vzSubj.json")
 
         # Find contract DN in specified tenant
         tenant_dn_prefix = f"uni/tn-{tenant_filter}/"
@@ -1685,9 +1866,9 @@ class ACIClient:
         tree = {contract_name: {"Filter Details": filters_detail_node}}
         self.print_tree(tree)
 
-    def handle_subnet_command(self, tenant_filter: Optional[str] = None, prefix_filter: Optional[str] = None, cidr_filter: Optional[str] = None):
+    def handle_subnet_command(self, tenant_filter: Optional[str] = None, prefix_filter: Optional[str] = None, ip_filter: Optional[str] = None):
         """List all subnets in the ACI fabric."""
-        self.list_all_subnets(tenant_filter, prefix_filter, cidr_filter)
+        self.list_all_subnets(tenant_filter, prefix_filter, ip_filter)
 
     def handle_aaep_command(self, aaep_name: Optional[str] = None, list_endpoints = False):
         """
@@ -1706,7 +1887,7 @@ class ACIClient:
         """List all Attachable Access Entity Profiles."""
         print("Listing all Attachable Access Entity Profiles (AAEPs):\n")
 
-        aaeps = self.cached_api("/api/node/class/infraAttEntityP.json")
+        aaeps = self.query_api("/api/node/class/infraAttEntityP.json")
 
         if not aaeps:
             print("No AAEPs found.")
@@ -1737,7 +1918,7 @@ class ACIClient:
         print(f"Connection map for AAEP: {aaep_name}\n")
 
         # Get AAEP details
-        aaeps = self.cached_api("/api/node/class/infraAttEntityP.json")
+        aaeps = self.query_api("/api/node/class/infraAttEntityP.json")
         aaep_obj = None
         aaep_dn = None
 
@@ -1755,7 +1936,7 @@ class ACIClient:
         tree = {}
 
         # 1. Find domains associated with this AAEP
-        domain_refs = self.cached_api("/api/node/class/infraRsDomP.json")
+        domain_refs = self.query_api("/api/node/class/infraRsDomP.json")
         domains = []
 
         for item in domain_refs:
@@ -1788,7 +1969,7 @@ class ACIClient:
             domain_tree = {}
             for domain_type, domain_name, domain_dn in domains:
                 # Get VLAN pool for this domain
-                vlan_pool_refs = self.cached_api("/api/node/class/infraRsVlanNs.json")
+                vlan_pool_refs = self.query_api("/api/node/class/infraRsVlanNs.json")
                 vlan_pools = []
 
                 for vp_item in vlan_pool_refs:
@@ -1807,7 +1988,7 @@ class ACIClient:
             tree["Domains"] = domain_tree
 
         # 2. Find interface policy groups that reference this AAEP
-        aaep_refs = self.cached_api("/api/node/class/infraRsAttEntP.json")
+        aaep_refs = self.query_api("/api/node/class/infraRsAttEntP.json")
         policy_groups = []
 
         for item in aaep_refs:
@@ -1837,7 +2018,7 @@ class ACIClient:
         # Get all interface selectors
         if policy_groups:
             # Get interface profile relationships
-            rs_acc_base_grp = self.cached_api("/api/node/class/infraRsAccBaseGrp.json")
+            rs_acc_base_grp = self.query_api("/api/node/class/infraRsAccBaseGrp.json")
 
             for pg_type, pg_name in policy_groups:
                 # Find which interface selectors use this policy group
@@ -1864,7 +2045,7 @@ class ACIClient:
 
                             if profile_name and selector_name:
                                 # Get port blocks for this selector
-                                port_blocks = self.get_api(
+                                port_blocks = self.query_api(
                                     f"/api/mo/{dn}.json?query-target=children&target-subtree-class=infraPortBlk"
                                 )
 
@@ -1880,7 +2061,7 @@ class ACIClient:
                                         ports.append(f"Ports {from_port}-{to_port}")
 
                                 # Find which switch profiles use this interface profile
-                                rs_acc_port_p = self.cached_api("/api/node/class/infraRsAccPortP.json")
+                                rs_acc_port_p = self.query_api("/api/node/class/infraRsAccPortP.json")
 
                                 for sw_item in rs_acc_port_p:
                                     sw_attr = sw_item["infraRsAccPortP"]["attributes"]
@@ -1891,7 +2072,7 @@ class ACIClient:
                                             sw_profile = sw_dn.split("/nprof-")[1].split("/")[0]
 
                                             # Get node selectors for this switch profile
-                                            node_sels = self.get_api(
+                                            node_sels = self.query_api(
                                                 f"/api/mo/uni/infra/nprof-{sw_profile}.json?query-target=children&target-subtree-class=infraNodeBlk"
                                             )
 
@@ -1939,7 +2120,7 @@ class ACIClient:
             epg_candidates = set()  # EPGs that use our domains
 
             if domain_dns:
-                epg_domains = self.cached_api("/api/node/class/fvRsDomAtt.json")
+                epg_domains = self.query_api("/api/node/class/fvRsDomAtt.json")
 
                 for item in epg_domains:
                     attr = item["fvRsDomAtt"]["attributes"]
@@ -1960,7 +2141,7 @@ class ACIClient:
             topology_paths = set()
 
             # Get all interface selectors that reference this AAEP's policy groups
-            rs_acc_base_grp = self.cached_api("/api/node/class/infraRsAccBaseGrp.json")
+            rs_acc_base_grp = self.query_api("/api/node/class/infraRsAccBaseGrp.json")
 
             for pg_type, pg_name in policy_groups:
                 for item in rs_acc_base_grp:
@@ -1977,7 +2158,7 @@ class ACIClient:
                             hports_dn = dn.rsplit("/", 1)[0] if "/rsaccBaseGrp" in dn else dn
 
                             # Get port blocks for this selector
-                            port_blocks = self.get_api(
+                            port_blocks = self.query_api(
                                 f"/api/mo/{hports_dn}.json?query-target=children&target-subtree-class=infraPortBlk"
                             )
 
@@ -2023,7 +2204,7 @@ class ACIClient:
 
                                         # Query existing static path bindings to find which leaf node(s) this FEX is connected to
                                         # This is more reliable than querying fabric topology
-                                        all_paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
+                                        all_paths = self.query_api("/api/node/class/fvRsPathAtt.json")
 
                                         leaf_ids = set()
                                         for path_item in all_paths:
@@ -2043,7 +2224,7 @@ class ACIClient:
                                                     topology_paths.add(path)
                                 else:
                                     # Regular access port profile
-                                    rs_acc_port_p = self.cached_api("/api/node/class/infraRsAccPortP.json")
+                                    rs_acc_port_p = self.query_api("/api/node/class/infraRsAccPortP.json")
 
                                     for sw_item in rs_acc_port_p:
                                         sw_attr = sw_item["infraRsAccPortP"]["attributes"]
@@ -2054,7 +2235,7 @@ class ACIClient:
                                                 sw_profile = sw_dn.split("/nprof-")[1].split("/")[0]
 
                                                 # Get node selectors for this switch profile
-                                                node_sels = self.get_api(
+                                                node_sels = self.query_api(
                                                     f"/api/mo/uni/infra/nprof-{sw_profile}.json?query-target=children&target-subtree-class=infraNodeBlk"
                                                 )
 
@@ -2099,7 +2280,7 @@ class ACIClient:
 
             # Step 3: Filter EPG candidates to only those with static bindings to our paths
             if epg_candidates and topology_paths:
-                all_static_paths = self.cached_api("/api/node/class/fvRsPathAtt.json")
+                all_static_paths = self.query_api("/api/node/class/fvRsPathAtt.json")
 
                 for path_item in all_static_paths:
                     path_attr = path_item.get("fvRsPathAtt", {}).get("attributes", {})
@@ -2131,8 +2312,8 @@ class ACIClient:
                 return
 
             # Get all endpoints (MAC/IP) in bulk
-            all_endpoints = self.cached_api("/api/node/class/fvCEp.json")
-            all_ips = self.cached_api("/api/node/class/fvIp.json")
+            all_endpoints = self.query_api("/api/node/class/fvCEp.json")
+            all_ips = self.query_api("/api/node/class/fvIp.json")
 
             # Build a map of endpoint DN to IPs for faster lookup
             ip_map = {}
@@ -2288,7 +2469,7 @@ def main():
 
     # Dispatch to appropriate command handler method
     if args.command == "ip":
-        apic.handle_ip_command(args.ip)
+        apic.handle_ip_command(args.ip, args.prefix, args.tenant)
     elif args.command == "port":
         apic.handle_port_command(args.port, args.id, args.name)
     elif args.command == "vpc":
@@ -2302,11 +2483,11 @@ def main():
     elif args.command == "contract":
         apic.handle_contract_command(args.contract, args.tenant, args.filters)
     elif args.command == "subnet":
-        apic.handle_subnet_command(args.tenant, args.prefix, args.cidr)
+        apic.handle_subnet_command(args.tenant, args.prefix, args.filter)
     elif args.command == "aaep":
         apic.handle_aaep_command(args.name, args.list_endpoints)
     elif args.command == "route":
-        apic.handle_route_command(args.vrf, args.detail, args.filter, args.prefix)
+        apic.handle_route_command(args.vrf, args.detail, args.filter, args.prefix, args.local, args.external)
 
 if __name__ == "__main__":
     main()

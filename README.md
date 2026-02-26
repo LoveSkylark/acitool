@@ -126,17 +126,17 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 
 # Commands Overview
 
-| Command                                    | Description                                                  |
-| ------------------------------------------ | ------------------------------------------------------------ |
-| `clean <type>`                             | Find unused VRFs, BDs, EPGs, AAEPs, VLAN pools, etc.         |
-| `contract <name> [--tenant <tenant>]`      | Show providers, consumers, scope and exports for a contract. |
-| `tenant <tenant>`                          | Show all static bindings and SVI bindings in that tenant.    |
-| `ip <address>`                             | Look up endpoint, OSPF/BGP peer, static route or subnet.     |
-| `port <x/y> [-i <node-id>] [-n <name>]`   | Show all bindings on a physical port (EPG + L3Out).          |
-| `vpc <nodeA>-<nodeB> [vpc-name]`           | Show VPC interfaces or their bindings.                       |
-| `vlan <vlan-id>`                           | Show all EPG/L3Out/CEp bindings and VLAN pool membership.    |
-| `subnet [CIDR] [--tenant T] [--prefix X]`  | List all subnets in the fabric, optionally filtered by CIDR. |
-| `route <tenant>:<vrf> [filter] [-p X] [-d]` | Show consolidated routing table for a VRF across all leaf nodes. |
+| Command                                                      | Description                                                                  |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| `clean <type>`                                               | Find unused VRFs, BDs, EPGs, AAEPs, VLAN pools, etc.                         |
+| `contract <name> [--tenant <tenant>]`                        | Show providers, consumers, scope and exports for a contract.                 |
+| `tenant <tenant>`                                            | Show all static bindings and SVI bindings in that tenant.                    |
+| `ip <address\|prefix> [-p X] [-t tenant]`                   | Look up endpoint, OSPF/BGP peer, static route, subnet or route table.        |
+| `port <x/y> [-i <node-id>] [-n <name>]`                     | Show all bindings on a physical port (EPG + L3Out).                          |
+| `vpc <nodeA>-<nodeB> [vpc-name]`                             | Show VPC interfaces or their bindings.                                       |
+| `vlan <vlan-id>`                                             | Show all EPG/L3Out/CEp bindings and VLAN pool membership.                    |
+| `subnet [filter] [--tenant T] [--prefix X]`                  | List all subnets in the fabric, optionally filtered by prefix or CIDR.       |
+| `route <tenant>:<vrf> [filter] [-p X] [-l\|-x] [-d]`        | Show consolidated routing table for a VRF across all leaf nodes.             |
 
 
 ---
@@ -248,7 +248,7 @@ tenant3:
 # ROUTE COMMAND
 
 ```bash
-acitool route <tenant>:<vrf> [filter] [-p PREFIX] [-d]
+acitool route <tenant>:<vrf> [filter] [-p PREFIX] [-l|-x] [-d]
 ```
 
 Shows a **consolidated IPv4 routing table** for a VRF, aggregated across all leaf nodes. Routes that exist on multiple leaves are shown as a single entry with all leaf node IDs listed.
@@ -279,7 +279,11 @@ Total: 4 prefix(es) across 2 leaf(s): 201, 202
 - **-p / --prefix**: Filter by subnet mask length
   - Example: `acitool route myTenant:myVRF -p /32` shows only host routes
 
-- **-d / --detail**: Include infrastructure routes (`direct`, `local`, `am`, `broadcast`, `urib_internal`, `overlay-1`)
+- **-l / --local**: Show only routes native to this VRF — excludes routes imported from other VRFs/tenants via contracts. `-l` and `-x` are mutually exclusive.
+
+- **-x / --external**: Show only routes imported from other VRFs or tenants via contracts. Useful for auditing what has been leaked into this VRF. `-l` and `-x` are mutually exclusive.
+
+- **-d / --detail**: Include all infrastructure routes (`direct`, `local`, `am`, `broadcast`, `urib_internal`, overlay-1 TEP routes)
 
 ---
 
@@ -322,17 +326,72 @@ Again grouped by pod/node/interface.
 # IP LOOKUP
 
 ```bash
-acitool ip <ip-address>
+acitool ip <address|prefix> [-p PREFIX] [-t TENANT]
 ```
 
-Finds:
+Searches the ACI fabric for any object associated with a given IP address or IP string prefix. Accepts either a **full IP address** or a **partial string prefix** (e.g., `10.5.1`).
 
-* Endpoint IP (fvIp)
-* OSPF neighbors
-* BGP peers
-* Static routes
-* Internal subnets
-* External L3Out subnets
+### Full IP lookup
+
+When a complete IP address is provided, the tool searches in priority order:
+
+1. **Endpoint** (fvIp) — the host is learned in an EPG; shows tenant, app profile, EPG, pod/node and interface selector
+2. **OSPF neighbor** (l3extIp) — the IP is an OSPF interface address on an L3Out
+3. **BGP peer** (bgpPeer) — the IP is a configured BGP peer
+4. **Static route** (ipRouteP) — the IP falls within a configured static route prefix
+5. **Internal subnet** (fvSubnet) — shown only when none of the above match; the IP falls inside a BD or EPG subnet
+6. **External L3Out subnet** (l3extSubnet) — shown only when none of the above match; the IP falls inside an L3Out external subnet
+7. **Route table** (uribv4Route) — always shown; lists every VRF routing table entry that contains the IP
+
+### Prefix lookup
+
+When a partial string is provided (e.g., `10.5.1`), the tool:
+
+- Searches for endpoints whose IP starts with the given string
+- Shows all BD/EPG subnets whose IP starts with the given string
+- Shows all L3Out external subnets whose IP starts with the given string
+- Shows all routing table entries whose prefix starts with the given string
+
+### Options
+
+- **-p / --prefix**: Filter all results to a specific subnet mask length
+  - Example: `acitool ip 10.5 -p /32` shows only host routes and /32 endpoint subnets
+  - Example: `acitool ip 10.5.1.1 -p /24` restricts route table to /24 entries
+
+- **-t / --tenant**: Limit the search to a single tenant
+  - Example: `acitool ip 10.5.1.1 -t myTenant` shows only results belonging to `myTenant`
+  - Applies to all result types: endpoints, peers, static routes, subnets and route table entries
+
+### Examples
+
+```bash
+acitool ip 10.5.1.1                       # full IP lookup across all tenants
+acitool ip 10.5.1.1 -t myTenant           # limit to a single tenant
+acitool ip 10.5.1.1 -p /32               # only show /32 entries in route table
+acitool ip 10.5.1.1 -t myTenant -p /32   # combine tenant and prefix filters
+acitool ip 10.5.1                         # prefix search — all objects starting with 10.5.1
+acitool ip 10.5 -p /24                   # prefix search, only /24 subnets and routes
+```
+
+### Output example (full IP)
+
+```
+Looking up IP: 10.5.1.60
+
+IP found in:
+  myTenant
+    AP:MyApp
+      WebEPG
+
+  Physical location: Pod-1, Node-201 MAC:[00:50:56:A8:CA:E3]
+  Interface Selector: eth1/1
+
+Route lookup across all VRFs:
+myTenant
+  VRF: myVRF
+    10.5.1.0/24
+    10.5.1.60/32
+```
 
 ---
 
@@ -438,6 +497,7 @@ Shows:
 
 ```bash
 acitool subnet
+acitool subnet 10.5.1
 acitool subnet 10.1.0.0/16
 acitool subnet 192.168.0.0/16 --tenant TenantA
 acitool subnet --prefix /30
@@ -450,9 +510,10 @@ Shows all subnets in the fabric, including:
 
 ### Filtering Options:
 
-- **CIDR Range** (positional): Filter subnets within a specific IP range
-  - Example: `acitool subnet 10.1.0.0/16` shows only subnets within 10.1.0.0/16
-  - Automatically handles IPv4/IPv6 version matching (IPv6 subnets are skipped when filtering by IPv4, and vice versa)
+- **filter** (positional, optional): Filter subnets by string prefix or CIDR containment
+  - **String prefix**: `acitool subnet 10.5.1` shows all subnets whose IP starts with `10.5.1`
+  - **CIDR range**: `acitool subnet 10.1.0.0/16` shows only subnets within `10.1.0.0/16`
+  - CIDR filtering automatically handles IPv4/IPv6 version matching (IPv6 subnets are skipped when filtering by IPv4, and vice versa)
 
 - **--tenant**: Filter by tenant name
   - Example: `acitool subnet --tenant Production`
@@ -530,6 +591,24 @@ acitool vlan 100
 acitool ip 10.1.1.1
 ```
 
+## Look up an IP restricted to a single tenant
+
+```bash
+acitool ip 10.1.1.1 -t myTenant
+```
+
+## Find all objects in the fabric starting with an IP prefix
+
+```bash
+acitool ip 10.1.1
+```
+
+## Show only /32 host routes for an IP
+
+```bash
+acitool ip 10.1.1.1 -p /32
+```
+
 ## Show all contracts in a tenant with their filters
 
 ```bash
@@ -564,6 +643,12 @@ acitool vpc 201-202
 
 ```bash
 acitool subnet --tenant external
+```
+
+## Find all subnets starting with a string prefix
+
+```bash
+acitool subnet 10.5.1
 ```
 
 ## Find all subnets within a specific CIDR range
