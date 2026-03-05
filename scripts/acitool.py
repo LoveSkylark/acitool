@@ -86,6 +86,8 @@ def parse_args():
     clean_sub.add_parser("empty", help="List EPGs with no MAC, IP addresses, or static bindings")
     clean_sub.add_parser("contract", help="List contracts with no provider/consumer or only one side assigned")
     clean_sub.add_parser("subnet", help="List all subnets in the fabric")
+    clean_filter_parser = clean_sub.add_parser("filter", help="List filters not attached to any contract subject")
+    clean_filter_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
 
     contract_parser = subparsers.add_parser("contract", help="Contract lookup")
     contract_parser.add_argument("contract", help="Contract name")
@@ -906,7 +908,7 @@ class ACIClient:
         else:
             print("All VLAN Pools are referenced.")
 
-    def handle_clean_command(self, clean_cmd: str):
+    def handle_clean_command(self, clean_cmd: str, tenant_filter: str = None):
         """Dispatch to appropriate clean subcommand handler."""
         handlers = {
             "vrf": self.handle_clean_vrf,
@@ -917,6 +919,7 @@ class ACIClient:
             "vlan": self.handle_clean_vlan,
             "contract": self.handle_clean_contract,
             "subnet": lambda: self.list_all_subnets(),
+            "filter": lambda: self.handle_clean_filter(tenant_filter),
         }
 
         handler = handlers.get(clean_cmd)
@@ -1052,6 +1055,50 @@ class ACIClient:
 
         if not found_issues:
             print("All contracts have both provider and consumer assigned.")
+
+    def handle_clean_filter(self, tenant_filter: str = None):
+        """List vzFilters not attached to any contract subject."""
+        scope = f" in tenant '{tenant_filter}'" if tenant_filter else ""
+        print(f"Checking for unused filters{scope}...\n")
+
+        all_filters = self.query_api("/api/node/class/vzFilter.json")
+        rs_subj_filt = self.query_api("/api/node/class/vzRsSubjFiltAtt.json")
+
+        # Build set of all filter DNs that are referenced by at least one subject
+        used_filter_dns = set()
+        for item in rs_subj_filt:
+            attr = item.get("vzRsSubjFiltAtt", {}).get("attributes", {})
+            tDn = attr.get("tDn", "")
+            if tDn:
+                used_filter_dns.add(tDn)
+
+        # Collect unused filters grouped by tenant
+        unused: Dict[str, List[str]] = {}
+        for item in all_filters:
+            attr = item.get("vzFilter", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            name = attr.get("name", "")
+
+            if not dn or "/tn-" not in dn or "/flt-" not in dn:
+                continue
+
+            tenant = dn.split("/tn-")[1].split("/")[0]
+
+            if tenant_filter and tenant != tenant_filter:
+                continue
+
+            if dn not in used_filter_dns:
+                unused.setdefault(tenant, []).append(name)
+
+        if not unused:
+            print(f"All filters{scope} are attached to at least one contract subject.")
+            return
+
+        for tenant in sorted(unused.keys()):
+            print(f"{tenant}:")
+            for f in sorted(unused[tenant]):
+                print(f"  - {f}")
+            print()
 
     def handle_contract_command(self, contract_name: str, tenant_filter: Optional[str] = None, filters_only: bool = False):
         """Find and display contract providers, consumers, and exports."""
@@ -2485,7 +2532,7 @@ def main():
     elif args.command == "tenant":
         apic.handle_tenant_command(args.tenant)
     elif args.command == "clean":
-        apic.handle_clean_command(args.clean_cmd)
+        apic.handle_clean_command(args.clean_cmd, getattr(args, "tenant", None))
     elif args.command == "contract":
         apic.handle_contract_command(args.contract, args.tenant, args.filters)
     elif args.command == "subnet":

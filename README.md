@@ -128,7 +128,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 
 | Command                                                      | Description                                                                  |
 | ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| `clean <type>`                                               | Find unused VRFs, BDs, EPGs, AAEPs, VLAN pools, etc.                         |
+| `clean <type> [-t tenant]`                                   | Find unused VRFs, BDs, EPGs, AAEPs, VLAN pools, filters, etc.                |
 | `contract <name> [--tenant <tenant>]`                        | Show providers, consumers, scope and exports for a contract.                 |
 | `tenant <tenant>`                                            | Show all static bindings and SVI bindings in that tenant.                    |
 | `ip <address\|prefix> [-p X] [-t tenant]`                   | Look up endpoint, OSPF/BGP peer, static route, subnet or route table.        |
@@ -146,7 +146,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 Run:
 
 ```bash
-acitool clean <vrf|bd|epg|empty|aaep|vlan|contract>
+acitool clean <vrf|bd|epg|empty|aaep|vlan|contract|filter>
 ```
 
 ---
@@ -241,6 +241,28 @@ Contracts with ONLY consumer (no provider):
 
 tenant3:
   - missing-provider
+```
+
+---
+
+## `clean filter [-t TENANT]`
+
+Finds **filters (vzFilter) not attached to any contract subject**. A filter is considered unused when no contract subject references it via `vzRsSubjFiltAtt`.
+
+- **-t / --tenant**: Limit the search to a single tenant
+  - Example: `acitool clean filter -t common` shows only unused filters inside the `common` tenant
+
+Output example:
+
+```
+Checking for unused filters...
+
+common:
+  - filter-unused-1
+  - old-icmp-filter
+
+myTenant:
+  - test-filter
 ```
 
 ---
