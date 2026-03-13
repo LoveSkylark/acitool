@@ -34,6 +34,12 @@ RE_PATH_TDN = re.compile(r"topology/pod-(?P<pod>\d+)/(?:prot)?paths-(?P<node>\d+
 RE_AAEP_TDN = re.compile(r"attentp-([^\]]+)$")
 RE_VLAN_POOL_TDN = re.compile(r"vlanns-\[(?P<pool>[^\]]+)\]")
 
+# Relation DNs
+RE_BD_VRF     = re.compile(r"uni/tn-(?P<tenant>[^/]+)/BD-(?P<bd>[^/]+)/rsctx$")
+RE_L3OUT_VRF  = re.compile(r"uni/tn-(?P<tenant>[^/]+)/out-(?P<l3out>[^/]+)/rsectx$")
+RE_EXT_SUBNET = re.compile(r"uni/tn-(?P<tenant>[^/]+)/out-(?P<l3out>[^/]+)/instP-(?P<instp>[^/]+)/extsubnet-")
+RE_ROUTE_DOM  = re.compile(r"/dom-(?P<dom>[^/]+)/")
+
 
 def parse_regex(regex: re.Pattern, text: str) -> Optional[Dict[str, Any]]:
     """

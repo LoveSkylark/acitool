@@ -26,6 +26,7 @@ from aci_parsers import (
     RE_VRF, RE_BD, RE_EPG, RE_EPG_DN,
     RE_L3OUT, RE_L3OUT_DN, RE_L3OUT_PATH,
     RE_PATH_TDN, RE_AAEP_TDN, RE_VLAN_POOL_TDN,
+    RE_BD_VRF, RE_L3OUT_VRF, RE_EXT_SUBNET, RE_ROUTE_DOM,
     parse_regex, extract_tenant_from_dn, format_epg_label,
     parse_epg_binding, parse_l3out_binding, parse_path_info,
     parse_vrf_info, parse_bd_info, parse_subnet_info, parse_endpoint_info
@@ -79,16 +80,27 @@ def parse_args():
     clean_parser = subparsers.add_parser("clean", help="Show unused VRFs or BDs")
     clean_sub = clean_parser.add_subparsers(dest="clean_cmd", required=True)
     clean_sub.add_parser("aaep", help="List AAEPs not assigned to any interface or static path")
+    clean_sub.add_parser("domain", help="List Physical, VMM, L3Out and FC domains not attached to any AAEP")
+    clean_static_parser = clean_sub.add_parser("static", help="List static path bindings referencing nodes no longer in the fabric")
+    clean_static_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
     clean_sub.add_parser("vlan", help="List VLAN pools not used by any Domain or AAEP")
     clean_sub.add_parser("vrf", help="List VRFs with no BD or L3Out attached")
     clean_sub.add_parser("bd",  help="List BDs with no EPG or L3Out attached")
+    clean_bd_gw_parser = clean_sub.add_parser("bd-gw", help="List BDs with a subnet configured but unicast routing disabled")
+    clean_bd_gw_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
     clean_sub.add_parser("epg", help="List EPGs without contracts, members, or static bindings")
     clean_sub.add_parser("empty", help="List EPGs with no MAC, IP addresses, or static bindings")
     clean_sub.add_parser("contract", help="List contracts with no provider/consumer or only one side assigned")
+    clean_overlap_parser = clean_sub.add_parser("overlap", help="List BD subnets that overlap with subnets in a different BD within the same VRF")
+    clean_overlap_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
     clean_subnet_parser = clean_sub.add_parser("subnet", help="List External EPG subnets with no matching route or filtered by default-export route-map")
     clean_subnet_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
     clean_filter_parser = clean_sub.add_parser("filter", help="List filters not attached to any contract subject")
     clean_filter_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
+
+    epg_parser = subparsers.add_parser("epg", help="Show full EPG details: BD/VRF, contracts, static bindings, endpoints")
+    epg_parser.add_argument("name", help="EPG name")
+    epg_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
 
     contract_parser = subparsers.add_parser("contract", help="Contract lookup")
     contract_parser.add_argument("contract", help="Contract name")
@@ -790,6 +802,50 @@ class ACIClient:
         else:
             print("No unused Bridge Domains found.")
 
+    def handle_clean_bd_gw(self, tenant_filter: Optional[str] = None):
+        """List BDs that have a subnet (gateway) configured but unicast routing disabled.
+        The gateway IP exists in config but will never route traffic."""
+        scope = f" in tenant '{tenant_filter}'" if tenant_filter else ""
+        print(f"Checking Bridge Domains{scope} with subnets but unicast routing disabled...\n")
+
+        # 1. Find all BDs where unicastRoute=no
+        no_route_bds = set()  # (tenant, bd)
+        for item in self.query_api("/api/node/class/fvBD.json"):
+            attr = item.get("fvBD", {}).get("attributes", {})
+            if attr.get("unicastRoute", "yes") != "no":
+                continue
+            m = parse_regex(RE_BD, attr.get("dn", ""))
+            if not m:
+                continue
+            if tenant_filter and m["tenant"] != tenant_filter:
+                continue
+            no_route_bds.add((m["tenant"], m["bd"]))
+
+        if not no_route_bds:
+            print("No BDs with unicast routing disabled found.")
+            return
+
+        # 2. Find subnets belonging to those BDs
+        issues = {}  # tenant -> bd_label -> [subnet, ...]
+        for item in self.query_api("/api/node/class/fvSubnet.json"):
+            attr = item.get("fvSubnet", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            ip = attr.get("ip", "")
+            if not ip:
+                continue
+            m = parse_regex(RE_BD, dn)
+            if not m:
+                continue
+            key = (m["tenant"], m["bd"])
+            if key not in no_route_bds:
+                continue
+            issues.setdefault(m["tenant"], {}).setdefault(m["bd"], []).append(ip)
+
+        if issues:
+            self.print_tree(issues, label="BDs with subnets but unicast routing disabled:")
+        else:
+            print("No issues found — all BDs with subnets have unicast routing enabled.")
+
     def handle_clean_epg(self):
         """List EPGs without contracts, members, or static bindings."""
         print("Checking EPGs without any contract, members, or static bindings...\n")
@@ -886,6 +942,165 @@ class ACIClient:
         else:
             print("All AAEPs are assigned somewhere.")
 
+    def handle_clean_domain(self):
+        """List Physical, VMM, L3Out and FC domains not attached to any AAEP."""
+        print("Checking domains not attached to any AAEP...\n")
+
+        # Collect all domains by type
+        # DN formats:
+        #   Physical : uni/phys-<name>
+        #   VMM      : uni/vmmp-<vendor>/dom-<name>
+        #   L3Out    : uni/l3dom-<name>
+        #   FC       : uni/fc-<name>
+        domain_classes = {
+            "physDomP":  ("Physical",  lambda dn: dn.split("uni/phys-")[-1]),
+            "vmmDomP":   ("VMM",       lambda dn: dn.split("/dom-")[-1]),
+            "l3extDomP": ("L3Out",     lambda dn: dn.split("uni/l3dom-")[-1]),
+            "fcDomP":    ("FC",        lambda dn: dn.split("uni/fc-")[-1]),
+        }
+
+        all_domains = {}  # dn -> (type_label, name)
+        for cls, (label, name_fn) in domain_classes.items():
+            for item in self.query_api(f"/api/node/class/{cls}.json"):
+                dn = item.get(cls, {}).get("attributes", {}).get("dn", "")
+                if dn:
+                    all_domains[dn] = (label, name_fn(dn))
+
+        if not all_domains:
+            print("No domains found.")
+            return
+
+        # Collect domain DNs referenced by any AAEP via infraRsDomP
+        used_dns = set()
+        for item in self.query_api("/api/node/class/infraRsDomP.json"):
+            tDn = item.get("infraRsDomP", {}).get("attributes", {}).get("tDn", "")
+            if tDn:
+                used_dns.add(tDn)
+
+        # Group unused domains by type
+        unused = {}
+        for dn, (label, name) in all_domains.items():
+            if dn not in used_dns:
+                unused.setdefault(label, []).append(name)
+
+        if unused:
+            tree = {"Global": {f"{label} Domains": sorted(names) for label, names in sorted(unused.items())}}
+            self.print_tree(tree, label="Domains not attached to any AAEP:")
+        else:
+            print("All domains are attached to an AAEP.")
+
+    def handle_clean_static(self, tenant_filter: Optional[str] = None):
+        """List static path bindings that reference a node no longer present in the fabric."""
+        scope = f" in tenant '{tenant_filter}'" if tenant_filter else ""
+        print(f"Checking static path bindings{scope} for missing fabric nodes...\n")
+
+        # Build set of ALL known node IDs regardless of state.
+        # Using all nodes (not just active) avoids false positives from temporarily
+        # offline nodes — we only want to flag nodes completely absent from the fabric.
+        all_node_ids = {
+            item.get("fabricNode", {}).get("attributes", {}).get("id", "")
+            for item in self.query_api("/api/node/class/fabricNode.json")
+        } - {""}
+
+        issues = {}
+        for item in self.query_api("/api/node/class/fvRsPathAtt.json"):
+            attr = item.get("fvRsPathAtt", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            tDn = attr.get("tDn", "")
+            encap = attr.get("encap", "")
+
+            m = parse_regex(RE_EPG, dn)
+            if not m:
+                continue
+            tenant, ap, epg = m["tenant"], m["ap"], m["epg"]
+            if tenant_filter and tenant != tenant_filter:
+                continue
+
+            path = parse_path_info(tDn)
+            if not path:
+                continue
+
+            # node may be "201" (single) or "201-202" (VPC protpath)
+            missing = [nid for nid in path.node.split("-") if nid not in all_node_ids]
+            if not missing:
+                continue
+
+            missing_label = ", ".join(missing)
+            line = f"{path.interface}  ({encap})  [node {missing_label} not in fabric]"
+            issues.setdefault(tenant, {}).setdefault(f"AP: {ap}", {}).setdefault(f"EPG: {epg}", []).append(line)
+
+        if issues:
+            self.print_tree(issues, label="Static bindings referencing nodes not in fabric:")
+        else:
+            print("No stale static bindings found.")
+
+    def handle_clean_overlap(self, tenant_filter: Optional[str] = None):
+        """List BD subnets that overlap with subnets in a different BD within the same VRF."""
+        scope = f" in tenant '{tenant_filter}'" if tenant_filter else ""
+        print(f"Checking for overlapping BD subnets{scope}...\n")
+
+        # 1. Map each BD to its VRF via fvRsCtx
+        bd_vrf_map = {}  # (tenant, bd) -> vrf_name
+        for item in self.query_api("/api/node/class/fvRsCtx.json"):
+            attr = item.get("fvRsCtx", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            m = parse_regex(RE_BD_VRF, dn)
+            if m:
+                bd_vrf_map[(m["tenant"], m["bd"])] = attr.get("tnFvCtxName", "")
+
+        # 2. Collect all BD subnets grouped by (tenant, vrf)
+        # Each entry: (bd_name, ip_str, ip_network)
+        vrf_subnets = {}  # (tenant, vrf) -> list of (bd, ip_str, ip_network)
+        for item in self.query_api("/api/node/class/fvSubnet.json"):
+            attr = item.get("fvSubnet", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            ip_str = attr.get("ip", "")
+            if not ip_str or ip_str in EXCLUDED_CIDRS:
+                continue
+            m = parse_regex(RE_BD, dn)
+            if not m:
+                continue
+            tenant, bd = m["tenant"], m["bd"]
+            if tenant_filter and tenant != tenant_filter:
+                continue
+            vrf = bd_vrf_map.get((tenant, bd))
+            if not vrf:
+                continue
+            try:
+                net = ip_network(ip_str, strict=False)
+            except ValueError:
+                continue
+            vrf_subnets.setdefault((tenant, vrf), []).append((bd, ip_str, net))
+
+        if not vrf_subnets:
+            print("No BD subnets found.")
+            return
+
+        # 3. For each VRF, find all pairs of subnets in different BDs that overlap
+        issues = {}  # tenant -> vrf_label -> [lines]
+        for (tenant, vrf), entries in vrf_subnets.items():
+            seen = set()
+            for i, (bd_a, ip_a, net_a) in enumerate(entries):
+                for bd_b, ip_b, net_b in entries[i + 1:]:
+                    if bd_a == bd_b:
+                        continue
+                    if net_a.version != net_b.version:
+                        continue
+                    if not net_a.overlaps(net_b):
+                        continue
+                    # Deduplicate: store pair as frozenset of (bd, ip) tuples
+                    pair = frozenset([(bd_a, ip_a), (bd_b, ip_b)])
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    line = f"{ip_a} (BD: {bd_a})  <->  {ip_b} (BD: {bd_b})"
+                    issues.setdefault(tenant, {}).setdefault(f"VRF: {vrf}", []).append(line)
+
+        if issues:
+            self.print_tree(issues, label="Overlapping BD subnets within the same VRF:")
+        else:
+            print("No overlapping BD subnets found.")
+
     def handle_clean_vlan(self):
         """List VLAN Pools not used by any Domain or AAEP."""
         print("Checking VLAN Pools not used by any Domain or AAEP...\n")
@@ -921,9 +1136,9 @@ class ACIClient:
         for item in self.query_api("/api/node/class/l3extRsEctx.json"):
             attr = item.get("l3extRsEctx", {}).get("attributes", {})
             dn = attr.get("dn", "")
-            m = re.match(r"uni/tn-([^/]+)/out-([^/]+)/rsectx$", dn)
+            m = parse_regex(RE_L3OUT_VRF, dn)
             if m:
-                l3out_vrf_map[(m.group(1), m.group(2))] = attr.get("tnFvCtxName", "")
+                l3out_vrf_map[(m["tenant"], m["l3out"])] = attr.get("tnFvCtxName", "")
 
         # 2. Collect all External EPG subnets (l3extSubnet)
         ext_subnets = {}  # (tenant, l3out, instp) -> list of ip_str
@@ -933,10 +1148,10 @@ class ACIClient:
             ip_str = attr.get("ip", "")
             if not ip_str or ip_str in EXCLUDED_CIDRS:
                 continue
-            m = re.match(r"uni/tn-([^/]+)/out-([^/]+)/instP-([^/]+)/extsubnet-", dn)
+            m = parse_regex(RE_EXT_SUBNET, dn)
             if not m:
                 continue
-            tenant, l3out, instp = m.group(1), m.group(2), m.group(3)
+            tenant, l3out, instp = m["tenant"], m["l3out"], m["instp"]
             if tenant_filter and tenant != tenant_filter:
                 continue
             ext_subnets.setdefault((tenant, l3out, instp), []).append(ip_str)
@@ -963,10 +1178,10 @@ class ACIClient:
                 if not prefix:
                     continue
                 # DN: topology/pod-X/node-Y/sys/uribv4/dom-TENANT:VRF/db-rt/rt-[prefix]
-                m = re.search(r"/dom-([^/]+)/", dn)
-                if not m or m.group(1) not in needed_doms:
+                m = parse_regex(RE_ROUTE_DOM, dn)
+                if not m or m["dom"] not in needed_doms:
                     continue
-                dom = m.group(1)
+                dom = m["dom"]
                 if ":" not in dom:
                     continue
                 tenant, vrf = dom.split(":", 1)
@@ -1013,9 +1228,13 @@ class ACIClient:
         handlers = {
             "vrf": self.handle_clean_vrf,
             "bd": self.handle_clean_bd,
+            "bd-gw": lambda: self.handle_clean_bd_gw(tenant_filter),
             "epg": self.handle_clean_epg,
             "empty": self.handle_clean_empty,
             "aaep": self.handle_clean_aaep,
+            "domain": self.handle_clean_domain,
+            "static": lambda: self.handle_clean_static(tenant_filter),
+            "overlap": lambda: self.handle_clean_overlap(tenant_filter),
             "vlan": self.handle_clean_vlan,
             "contract": self.handle_clean_contract,
             "subnet": lambda: self.handle_clean_subnet(tenant_filter),
@@ -1512,6 +1731,153 @@ class ACIClient:
                     print(f"{'':>{cp}} {proto:<{co}} {via:<{cn}} {leafs_str}")
 
         print(f"\nTotal: {printed} prefix(es) across {len(all_nodes)} leaf(s): {', '.join(sorted(all_nodes, key=int))}")
+
+    def handle_epg_command(self, epg_name: str, tenant_filter: Optional[str] = None):
+        """Show full details for an EPG: BD/VRF, contracts, subnets, static bindings, endpoints."""
+
+        # 1. Locate matching EPG(s)
+        all_epgs = self.query_api("/api/node/class/fvAEPg.json")
+        matches = []
+        for item in all_epgs:
+            attr = item.get("fvAEPg", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            m = parse_regex(RE_EPG, dn)
+            if not m or attr.get("name", "") != epg_name:
+                continue
+            if tenant_filter and m["tenant"] != tenant_filter:
+                continue
+            matches.append((m["tenant"], m["ap"], m["epg"], dn))
+
+        if not matches:
+            prefix_tree = {}
+            for item in all_epgs:
+                attr = item.get("fvAEPg", {}).get("attributes", {})
+                dn = attr.get("dn", "")
+                m = parse_regex(RE_EPG, dn)
+                if not m or not attr.get("name", "").startswith(epg_name):
+                    continue
+                if tenant_filter and m["tenant"] != tenant_filter:
+                    continue
+                prefix_tree.setdefault(m["tenant"], {}).setdefault(m["ap"], []).append(m["epg"])
+            if prefix_tree:
+                print(f"No exact match for EPG '{epg_name}'. Possible matches:\n")
+                self.print_tree(prefix_tree)
+            else:
+                print(f"EPG '{epg_name}' not found.")
+            return
+
+        if len(matches) > 1:
+            print(f"EPG '{epg_name}' found in multiple tenants. Use -t to specify:\n")
+            tree = {}
+            for tenant, ap, epg, _ in matches:
+                tree.setdefault(tenant, {}).setdefault(ap, []).append(epg)
+            self.print_tree(tree)
+            return
+
+        tenant, ap, epg, _ = matches[0]
+        epg_prefix = f"uni/tn-{tenant}/ap-{ap}/epg-{epg}"
+
+        # 2. BD and VRF (global cached queries)
+        bd_vrf_map = {}  # (tenant, bd) -> vrf
+        for item in self.query_api("/api/node/class/fvRsCtx.json"):
+            attr = item.get("fvRsCtx", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            m = parse_regex(RE_BD_VRF, dn)
+            if m:
+                bd_vrf_map[(m["tenant"], m["bd"])] = attr.get("tnFvCtxName", "")
+
+        bd_name = next(
+            (item["fvRsBd"]["attributes"].get("tnFvBDName", "")
+             for item in self.query_api("/api/node/class/fvRsBd.json")
+             if item.get("fvRsBd", {}).get("attributes", {}).get("dn", "").startswith(epg_prefix)),
+            None
+        )
+        vrf_name = bd_vrf_map.get((tenant, bd_name), "") if bd_name else ""
+
+        # 3. Contracts (global cached)
+        provided = sorted({
+            item["fvRsProv"]["attributes"].get("tnVzBrCPName", "")
+            for item in self.query_api("/api/node/class/fvRsProv.json")
+            if item.get("fvRsProv", {}).get("attributes", {}).get("dn", "").startswith(epg_prefix)
+        } - {""})
+        consumed = sorted({
+            item["fvRsCons"]["attributes"].get("tnVzBrCPName", "")
+            for item in self.query_api("/api/node/class/fvRsCons.json")
+            if item.get("fvRsCons", {}).get("attributes", {}).get("dn", "").startswith(epg_prefix)
+        } - {""})
+
+        # 4. EPG-level subnets (global cached)
+        epg_subnets = sorted(
+            item["fvSubnet"]["attributes"].get("ip", "")
+            for item in self.query_api("/api/node/class/fvSubnet.json")
+            if item.get("fvSubnet", {}).get("attributes", {}).get("dn", "").startswith(epg_prefix)
+            and item.get("fvSubnet", {}).get("attributes", {}).get("ip", "")
+        )
+
+        # 5. Static path bindings (global cached)
+        binding_tree = {}
+        for item in self.query_api("/api/node/class/fvRsPathAtt.json"):
+            attr = item.get("fvRsPathAtt", {}).get("attributes", {})
+            if not attr.get("dn", "").startswith(epg_prefix):
+                continue
+            path = parse_path_info(attr.get("tDn", ""))
+            if path:
+                node_label = self.normalize_node_label(path.pod, path.node)
+                binding_tree.setdefault(f"Pod-{path.pod}", {}).setdefault(node_label, []).append(
+                    f"{path.interface}  ({attr.get('encap', '')})"
+                )
+
+        # 6. Endpoints (scoped query — endpoint table can be very large)
+        ceps = self.query_api("/api/node/class/fvCEp.json", f'wcard(fvCEp.dn,"{epg_prefix}")')
+        ip_data = self.query_api("/api/node/class/fvIp.json", f'wcard(fvIp.dn,"{epg_prefix}")')
+
+        ip_map = {}  # cep_dn -> [ip, ...]
+        for item in ip_data:
+            attr = item.get("fvIp", {}).get("attributes", {})
+            ip_addr = attr.get("addr", "")
+            if ip_addr and ip_addr != "0.0.0.0":
+                cep_dn = attr.get("dn", "").split("/ip-")[0]
+                ip_map.setdefault(cep_dn, []).append(ip_addr)
+
+        ep_lines = []
+        for item in ceps:
+            attr = item.get("fvCEp", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            mac = attr.get("mac", "")
+            encap = attr.get("encap", "")
+            for ip in ip_map.get(dn, [""]):
+                ep_lines.append(f"{mac}  {ip}  ({encap})" if ip else f"{mac}  ({encap})")
+        ep_lines.sort()
+
+        # 7. Print
+        print(f"EPG: {tenant} / {ap} / {epg}")
+        print(f"  BD:  {bd_name or '(none)'}")
+        print(f"  VRF: {vrf_name or '(unknown)'}\n")
+
+        tree = {}
+        if provided or consumed:
+            contracts = {}
+            if provided:
+                contracts["Provided"] = provided
+            if consumed:
+                contracts["Consumed"] = consumed
+            tree["Contracts"] = contracts
+        if epg_subnets:
+            tree["Subnets"] = epg_subnets
+        if binding_tree:
+            tree["Static Bindings"] = binding_tree
+        if ep_lines:
+            tree[f"Endpoints ({len(ep_lines)})"] = ep_lines
+
+        if tree:
+            self.print_tree(tree)
+
+        if not provided and not consumed:
+            print("  Contracts:       (none)")
+        if not binding_tree:
+            print("  Static Bindings: (none)")
+        if not ep_lines:
+            print("  Endpoints:       (none)")
 
     def handle_tenant_command(self, tenant_name: str):
         """List all static and SVI bindings for a tenant."""
@@ -2633,6 +2999,8 @@ def main():
         apic.handle_tenant_command(args.tenant)
     elif args.command == "clean":
         apic.handle_clean_command(args.clean_cmd, getattr(args, "tenant", None))
+    elif args.command == "epg":
+        apic.handle_epg_command(args.name, args.tenant)
     elif args.command == "contract":
         apic.handle_contract_command(args.contract, args.tenant, args.filters)
     elif args.command == "subnet":

@@ -129,6 +129,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 | Command                                                      | Description                                                                  |
 | ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
 | `clean <type> [-t tenant]`                                   | Find unused VRFs, BDs, EPGs, AAEPs, VLAN pools, filters, etc.                |
+| `epg <name> [-t tenant]`                                     | Show full EPG details: BD/VRF, contracts, subnets, static bindings, endpoints. |
 | `contract <name> [--tenant <tenant>]`                        | Show providers, consumers, scope and exports for a contract.                 |
 | `tenant <tenant>`                                            | Show all static bindings and SVI bindings in that tenant.                    |
 | `ip <address\|prefix> [-p X] [-t tenant]`                   | Look up endpoint, OSPF/BGP peer, static route, subnet or route table.        |
@@ -146,7 +147,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 Run:
 
 ```bash
-acitool clean <vrf|bd|epg|empty|aaep|vlan|contract|subnet|filter>
+acitool clean <vrf|bd|bd-gw|epg|empty|aaep|domain|static|vlan|contract|overlap|subnet|filter>
 ```
 
 ---
@@ -169,6 +170,25 @@ tenantA
 ## `clean bd`
 
 Finds **BDs with no EPG and no L3Out subnet**.
+
+---
+
+## `clean bd-gw [-t TENANT]`
+
+Finds **BDs that have a subnet (gateway IP) configured but unicast routing disabled**. The gateway exists in the configuration but the BD will never route traffic — endpoints in the BD are effectively isolated at L3 regardless of what contracts are configured.
+
+- **-t / --tenant**: Limit the check to a single tenant
+
+Output example:
+
+```
+BDs with subnets but unicast routing disabled:
+
+myTenant
+└── BD-Web
+    ├── 10.1.1.1/24
+    └── 10.1.2.1/24
+```
 
 ---
 
@@ -198,6 +218,25 @@ This command shows EPGs that may have contracts configured but have no actual en
 ## `clean aaep`
 
 Finds **AAEPs not mapped to any interface or domain**.
+
+---
+
+## `clean domain`
+
+Finds **Physical, VMM, L3Out, and FC domains not attached to any AAEP**. A domain with no AAEP attachment cannot be used for any EPG or interface policy, making it safe to remove.
+
+Output example:
+
+```
+Domains not attached to any AAEP:
+
+Global
+├── L3Out Domains
+│   └── old-l3dom
+└── Physical Domains
+    ├── legacy-phys
+    └── test-phys
+```
 
 ---
 
@@ -241,6 +280,63 @@ Contracts with ONLY consumer (no provider):
 
 tenant3:
   - missing-provider
+```
+
+---
+
+## `clean static [-t TENANT]`
+
+Finds **static path bindings pointing to a node that no longer exists in the fabric**. This is common after a leaf replacement — the old node ID disappears from fabric inventory but its static bindings remain, silently doing nothing.
+
+Only checks node presence (any state, including inactive). Nodes that are temporarily offline but still registered in the fabric will not trigger a false positive — only nodes completely absent from the fabric database are flagged.
+
+- **-t / --tenant**: Limit the check to a single tenant
+
+Output example:
+
+```
+Static bindings referencing nodes not in fabric:
+
+myTenant
+└── AP: myApp
+    └── EPG: myEPG
+        ├── eth1/1  (vlan-100)  [node 203 not in fabric]
+        └── eth1/2  (vlan-100)  [node 203 not in fabric]
+```
+
+Examples:
+
+```bash
+acitool clean static                 # check all tenants
+acitool clean static -t myTenant     # limit to a single tenant
+```
+
+---
+
+## `clean overlap [-t TENANT]`
+
+Finds **BD subnets that overlap with subnets in a different BD within the same VRF**. Overlapping subnets across BDs in the same VRF create routing ambiguity and can cause traffic to be forwarded to the wrong BD.
+
+Only cross-BD overlaps are reported — multiple subnets within the same BD are handled correctly by ACI.
+
+- **-t / --tenant**: Limit the check to a single tenant
+
+Output example:
+
+```
+Overlapping BD subnets within the same VRF:
+
+myTenant
+└── VRF: myVRF
+    ├── 10.1.0.0/16 (BD: BD-Core)  <->  10.1.1.0/24 (BD: BD-Web)
+    └── 192.168.0.0/23 (BD: BD-A)  <->  192.168.1.0/24 (BD: BD-B)
+```
+
+Examples:
+
+```bash
+acitool clean overlap                  # check all tenants
+acitool clean overlap -t myTenant      # limit to a single tenant
 ```
 
 ---
@@ -335,6 +431,60 @@ Total: 4 prefix(es) across 2 leaf(s): 201, 202
 - **-x / --external**: Show only routes imported from other VRFs or tenants via contracts. Useful for auditing what has been leaked into this VRF. `-l` and `-x` are mutually exclusive.
 
 - **-d / --detail**: Include all infrastructure routes (`direct`, `local`, `am`, `broadcast`, `urib_internal`, overlay-1 TEP routes)
+
+---
+
+# EPG COMMAND
+
+```bash
+acitool epg <name> [-t TENANT]
+```
+
+Shows a full summary for a single EPG in one shot:
+
+- **BD / VRF** — which Bridge Domain and VRF the EPG is associated with
+- **Contracts** — provided and consumed contracts
+- **Subnets** — subnets configured directly on the EPG (not BD subnets)
+- **Static Bindings** — physical ports/nodes the EPG is deployed on, grouped by Pod → Node → interface (encap)
+- **Endpoints** — all currently learned MAC/IP addresses
+
+If the EPG name exists in more than one tenant, all matches are listed and `-t` is required to drill in. If no exact match is found, a prefix search is shown.
+
+### Options
+
+- **-t / --tenant**: Limit the search to a single tenant
+
+### Output example
+
+```
+EPG: myTenant / myApp / myEPG
+  BD:  myBD
+  VRF: myVRF
+
+Contracts
+├── Provided
+│   └── web-contract
+└── Consumed
+    └── shared-services
+
+Static Bindings
+└── Pod-1
+    └── leaf1 [201]
+        ├── eth1/1  (vlan-100)
+        └── eth1/2  (vlan-100)
+
+Endpoints (2)
+├── 00:50:56:A8:CA:E3  10.1.1.10  (vlan-100)
+└── 00:50:56:A8:CA:E4  10.1.1.11  (vlan-100)
+```
+
+### Examples
+
+```bash
+acitool epg myEPG                    # search across all tenants
+acitool epg myEPG -t myTenant        # limit to a single tenant
+acitool epg web                      # prefix search if no exact match
+```
 
 ---
 
