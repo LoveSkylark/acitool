@@ -146,7 +146,7 @@ By default, SSL certificate verification is disabled. To enable SSL verification
 Run:
 
 ```bash
-acitool clean <vrf|bd|epg|empty|aaep|vlan|contract|filter>
+acitool clean <vrf|bd|epg|empty|aaep|vlan|contract|subnet|filter>
 ```
 
 ---
@@ -241,6 +241,35 @@ Contracts with ONLY consumer (no provider):
 
 tenant3:
   - missing-provider
+```
+
+---
+
+## `clean subnet [-t TENANT]`
+
+Finds **External EPG subnets whose contracts will silently fail** because the prefix has no matching route in the VRF routing table.
+
+A subnet is flagged when the VRF has no route that matches it — whether because the external router isn't advertising the prefix, or because an import route-map dropped it before it reached the fabric. Either way, the result is the same: no route, no traffic, broken contract.
+
+- **-t / --tenant**: Limit the check to a single tenant
+
+Output example:
+
+```
+External EPG subnets with no matching route:
+
+SKRD
+└── L3Out: SKRD-FW  (vrf: SKRD)
+    └── InstP: SKRD-Servers
+        ├── 10.150.78.0/24
+        └── 10.100.175.0/24
+```
+
+Examples:
+
+```bash
+acitool clean subnet                 # check all tenants
+acitool clean subnet -t myTenant     # limit to a single tenant
 ```
 
 ---

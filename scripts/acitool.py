@@ -85,7 +85,8 @@ def parse_args():
     clean_sub.add_parser("epg", help="List EPGs without contracts, members, or static bindings")
     clean_sub.add_parser("empty", help="List EPGs with no MAC, IP addresses, or static bindings")
     clean_sub.add_parser("contract", help="List contracts with no provider/consumer or only one side assigned")
-    clean_sub.add_parser("subnet", help="List all subnets in the fabric")
+    clean_subnet_parser = clean_sub.add_parser("subnet", help="List External EPG subnets with no matching route or filtered by default-export route-map")
+    clean_subnet_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
     clean_filter_parser = clean_sub.add_parser("filter", help="List filters not attached to any contract subject")
     clean_filter_parser.add_argument("-t", "--tenant", default=None, help="Limit to a single tenant")
 
@@ -908,6 +909,105 @@ class ACIClient:
         else:
             print("All VLAN Pools are referenced.")
 
+    def handle_clean_subnet(self, tenant_filter: Optional[str] = None):
+        """List External EPG subnets with no matching route in the VRF routing table.
+        If a route doesn't exist — whether because the router isn't advertising it or
+        because an import route-map dropped it — the contract will silently fail."""
+        scope = f" in tenant '{tenant_filter}'" if tenant_filter else ""
+        print(f"Checking External EPG subnets{scope} for missing routes...\n")
+
+        # 1. Build L3Out -> VRF map via l3extRsEctx
+        l3out_vrf_map = {}  # (tenant, l3out) -> vrf_name
+        for item in self.query_api("/api/node/class/l3extRsEctx.json"):
+            attr = item.get("l3extRsEctx", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            m = re.match(r"uni/tn-([^/]+)/out-([^/]+)/rsectx$", dn)
+            if m:
+                l3out_vrf_map[(m.group(1), m.group(2))] = attr.get("tnFvCtxName", "")
+
+        # 2. Collect all External EPG subnets (l3extSubnet)
+        ext_subnets = {}  # (tenant, l3out, instp) -> list of ip_str
+        for item in self.query_api("/api/node/class/l3extSubnet.json"):
+            attr = item.get("l3extSubnet", {}).get("attributes", {})
+            dn = attr.get("dn", "")
+            ip_str = attr.get("ip", "")
+            if not ip_str or ip_str in EXCLUDED_CIDRS:
+                continue
+            m = re.match(r"uni/tn-([^/]+)/out-([^/]+)/instP-([^/]+)/extsubnet-", dn)
+            if not m:
+                continue
+            tenant, l3out, instp = m.group(1), m.group(2), m.group(3)
+            if tenant_filter and tenant != tenant_filter:
+                continue
+            ext_subnets.setdefault((tenant, l3out, instp), []).append(ip_str)
+
+        if not ext_subnets:
+            print("No External EPG subnets found.")
+            return
+
+        # 3. Query all routes in one pass per address family, then index by VRF.
+        #    This avoids one API call per VRF (which dominates runtime on large fabrics).
+        needed_doms = {
+            f"{t}:{v}"
+            for (t, l, _) in ext_subnets
+            for v in [l3out_vrf_map.get((t, l))]
+            if v
+        }
+
+        vrf_routes = {}  # (tenant, vrf) -> set of ip_network
+        for cls in ("uribv4Route", "uribv6Route"):
+            for r in self.query_api(f"/api/node/class/{cls}.json"):
+                attr = r.get(cls, {}).get("attributes", {})
+                dn = attr.get("dn", "")
+                prefix = attr.get("prefix", "")
+                if not prefix:
+                    continue
+                # DN: topology/pod-X/node-Y/sys/uribv4/dom-TENANT:VRF/db-rt/rt-[prefix]
+                m = re.search(r"/dom-([^/]+)/", dn)
+                if not m or m.group(1) not in needed_doms:
+                    continue
+                dom = m.group(1)
+                if ":" not in dom:
+                    continue
+                tenant, vrf = dom.split(":", 1)
+                try:
+                    vrf_routes.setdefault((tenant, vrf), set()).add(ip_network(prefix, strict=False))
+                except ValueError:
+                    pass
+
+        # 4. Flag any External EPG subnet with no matching route in the VRF
+        issues = {}  # tenant -> l3out_label -> instp_label -> [lines]
+        for (tenant, l3out, instp), subnets in ext_subnets.items():
+            vrf = l3out_vrf_map.get((tenant, l3out))
+            route_set = vrf_routes.get((tenant, vrf), set()) if vrf else None
+
+            for ip_str in subnets:
+                try:
+                    net = ip_network(ip_str, strict=False)
+                except ValueError:
+                    continue
+
+                if route_set is None:
+                    continue
+
+                route_exists = any(
+                    r.version == net.version and (
+                        net == r or net.subnet_of(r) or r.subnet_of(net)
+                    )
+                    for r in route_set
+                )
+
+                if not route_exists:
+                    vrf_label = vrf if vrf else "unknown-vrf"
+                    l3out_key = f"L3Out: {l3out}  (vrf: {vrf_label})"
+                    instp_key = f"InstP: {instp}"
+                    issues.setdefault(tenant, {}).setdefault(l3out_key, {}).setdefault(instp_key, []).append(ip_str)
+
+        if issues:
+            self.print_tree(issues, label="External EPG subnets with no matching route:")
+        else:
+            print("No issues found — all External EPG subnets have a matching route in the VRF.")
+
     def handle_clean_command(self, clean_cmd: str, tenant_filter: str = None):
         """Dispatch to appropriate clean subcommand handler."""
         handlers = {
@@ -918,7 +1018,7 @@ class ACIClient:
             "aaep": self.handle_clean_aaep,
             "vlan": self.handle_clean_vlan,
             "contract": self.handle_clean_contract,
-            "subnet": lambda: self.list_all_subnets(),
+            "subnet": lambda: self.handle_clean_subnet(tenant_filter),
             "filter": lambda: self.handle_clean_filter(tenant_filter),
         }
 
